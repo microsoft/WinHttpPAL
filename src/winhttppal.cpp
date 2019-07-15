@@ -322,8 +322,8 @@ static void ConvertCstrAssign(const TCHAR *lpstr, size_t cLen, std::string &targ
     size_t bLen = cLen;
 
 #ifdef UNICODE
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-	target = conv.to_bytes(std::wstring(lpstr, cLen));
+    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+    target = conv.to_bytes(std::wstring(lpstr, cLen));
 #else
     target.assign(lpstr, cLen);
 #endif
@@ -3035,8 +3035,8 @@ BOOLAPI WinHttpQueryHeaders(
 #ifdef UNICODE
         TSTRING subject;
 
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-		subject = conv.from_bytes(request->GetHeaderString());
+        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+        subject = conv.from_bytes(request->GetHeaderString());
         subject[request->GetHeaderString().length()] = TEXT('\0');
 
 #else
@@ -3109,10 +3109,10 @@ BOOLAPI WinHttpQueryHeaders(
         length = header.size();
 
 #ifdef UNICODE
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-		std::wstring wc = conv.from_bytes(header);
-		std::copy(wc.begin(), wc.end(), wbuffer);
-		wbuffer[header.length()] = TEXT('\0');
+        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+        std::wstring wc = conv.from_bytes(header);
+        std::copy(wc.begin(), wc.end(), wbuffer);
+        wbuffer[header.length()] = TEXT('\0');
 #else
         strncpy(wbuffer, header.c_str(), length);
 #endif
@@ -3154,10 +3154,10 @@ BOOLAPI WinHttpQueryHeaders(
             return FALSE;
 
 #ifdef UNICODE
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-		std::wstring wc = conv.from_bytes(request->GetHeaderString());
-		std::copy(wc.begin(), wc.end(), wbuffer);
-		wbuffer[request->GetHeaderString().length()] = TEXT('\0');
+        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+        std::wstring wc = conv.from_bytes(request->GetHeaderString());
+        std::copy(wc.begin(), wc.end(), wbuffer);
+        wbuffer[request->GetHeaderString().length()] = TEXT('\0');
 
 #else
         strncpy(wbuffer, request->GetHeaderString().c_str(), length);
@@ -3449,10 +3449,10 @@ WinHttpQueryOption
         TCHAR *wbuffer = reinterpret_cast<TCHAR*>(lpBuffer);
         size_t length = strlen(url);
 #ifdef UNICODE
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-		std::wstring wc = conv.from_bytes(std::string(url));
-		std::copy(wc.begin(), wc.end(), wbuffer);
-		wbuffer[strlen(url)] = TEXT('\0');
+        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+        std::wstring wc = conv.from_bytes(std::string(url));
+        std::copy(wc.begin(), wc.end(), wbuffer);
+        wbuffer[strlen(url)] = TEXT('\0');
 #else
         strncpy(wbuffer, url, length);
 #endif

@@ -57,6 +57,10 @@
 #include "winhttppal.h"
 #endif
 
+#ifndef WINHTTP_CURL_MAX_WRITE_SIZE
+#define WINHTTP_CURL_MAX_WRITE_SIZE CURL_MAX_WRITE_SIZE
+#endif
+
 #include <assert.h>
 extern "C"
 {
@@ -1955,9 +1959,7 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpen
 
         std::vector<std::string> proxies = Split(session->GetProxy(), ';');
         if (proxies.empty())
-        {
-            proxies.push_back(session->GetProxy());
-        }
+            proxies.push_back(std::string(pszProxyW));
         session->SetProxies(proxies);
     }
 
@@ -2443,6 +2445,9 @@ BOOLAPI WinHttpSendRequest
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_INFILESIZE_LARGE, (curl_off_t)totalsize);
         CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
+
+    res = curl_easy_setopt(request->GetCurl(), CURLOPT_BUFFERSIZE, WINHTTP_CURL_MAX_WRITE_SIZE);
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     request->GetTotalLength() = dwTotalLength;
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_READDATA, request);

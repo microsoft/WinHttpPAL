@@ -33,10 +33,19 @@
 #include <stdio.h>
 #include <string>
 #include <memory>
-#include <codecvt>
+#include <iomanip>
+#include <chrono>
 #include <openssl/err.h>
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
+
+#ifdef UNICODE
+#include <codecvt>
+#endif
+
+#ifdef WIN32
+#define localtime_r(_Time, _Tm) localtime_s(_Tm, _Time)
+#endif
 
 #define _WINHTTP_INTERNAL_
 #ifdef _MSC_VER
@@ -52,16 +61,46 @@
 extern "C"
 {
 #include <curl/curl.h>
+#include <curl/curlver.h>
 }
 
 class WinHttpSessionImp;
 class WinHttpRequestImp;
 
+#ifdef min
+#define MIN min
+#define MAX max
+#else
+#define MIN std::min
+#define MAX std::max
+#endif
+
+#ifdef UNICODE
+#define WCTLEN wcslen
+#define TSTRINGSTREAM std::wstringstream
+#define TSTRING std::wstring
+#define STRING_LITERAL "%S"
+#define TO_STRING std::to_wstring
+#define TREGEX std::wregex
+#define TREGEX_SEARCH std::regex_search
+#define TREGEX_MATCH std::wsmatch
+#else
+#define WCTLEN strlen
+#define TSTRINGSTREAM std::stringstream
+#define TEXT(T) T
+#define TSTRING std::string
+#define STRING_LITERAL "%s"
+#define TO_STRING std::to_string
+#define TREGEX std::regex
+#define TREGEX_SEARCH std::regex_search
+#define TREGEX_MATCH std::smatch
+#endif
+
 #ifdef _MSC_VER
 #pragma comment(lib, "Ws2_32.lib")
 #endif
 
-std::map<DWORD, TSTRING> StatusCodeMap = {
+static const std::map<DWORD, TSTRING> StatusCodeMap = {
 { 100, TEXT("Continue") },
 { 101, TEXT("Switching Protocols") },
 { 200, TEXT("OK") },
@@ -112,17 +151,17 @@ enum
     WINHTTP_CLASS_IMP,
 };
 
-int winhttp_tracing = false;
-int winhttp_tracing_verbose = false;
+static int winhttp_tracing = false;
+static int winhttp_tracing_verbose = false;
 
 #ifdef _MSC_VER
 int gettimeofday(struct timeval * tp, struct timezone * tzp);
 #endif
 
-std::mutex trcmtx;
+static std::mutex trcmtx;
 
 #ifndef _MSC_VER
-static void TRACE_INTERNAL(const char *fmt, ...) __attribute__ ((format (gnu_printf, 1, 2)));
+static void TRACE_INTERNAL(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 #endif
 
 static void TRACE_INTERNAL(const char *fmt, ...)
@@ -131,22 +170,26 @@ static void TRACE_INTERNAL(const char *fmt, ...)
     va_list args;
     va_start(args, fmt);
 
-    struct timeval tv;
-    time_t nowtime;
-    struct tm *nowtm;
-    char tmbuf[64], buf[64];
+    tm localTime;
+    std::chrono::system_clock::time_point t = std::chrono::system_clock::now();
+    time_t now = std::chrono::system_clock::to_time_t(t);
+    localtime_r(&now, &localTime);
 
-    gettimeofday(&tv, NULL);
-    nowtime = tv.tv_sec;
-    nowtm = localtime(&nowtime);
-    strftime(tmbuf, sizeof tmbuf, "%H:%M:%S", nowtm);
-    snprintf(buf, sizeof buf, "%s.%06ld ", tmbuf, tv.tv_usec);
-    printf("%s", buf);
+    const std::chrono::duration<double> tse = t.time_since_epoch();
+    std::chrono::seconds::rep milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(tse).count() % 1000;
 
     char szBuffer[512];
-    vsnprintf(szBuffer, sizeof szBuffer -1, fmt, args);
-    szBuffer[sizeof(szBuffer)/sizeof(szBuffer[0]) - 1] = '\0';
-    printf("%s", szBuffer);
+    vsnprintf(szBuffer, sizeof szBuffer - 1, fmt, args);
+    szBuffer[sizeof(szBuffer) / sizeof(szBuffer[0]) - 1] = '\0';
+
+    std::cout << (1900 + localTime.tm_year) << '-'
+        << std::setfill('0') << std::setw(2) << (localTime.tm_mon + 1) << '-'
+        << std::setfill('0') << std::setw(2) << localTime.tm_mday << ' '
+        << std::setfill('0') << std::setw(2) << localTime.tm_hour << ':'
+        << std::setfill('0') << std::setw(2) << localTime.tm_min << ':'
+        << std::setfill('0') << std::setw(2) << localTime.tm_sec << '.'
+        << std::setfill('0') << std::setw(3) << milliseconds << " " << szBuffer;
+
     va_end(args);
 }
 
@@ -156,7 +199,14 @@ static void TRACE_INTERNAL(const char *fmt, ...)
 #define TRACE_VERBOSE(fmt, ...) \
             do { if (winhttp_tracing_verbose) TRACE_INTERNAL(fmt, __VA_ARGS__); } while (0)
 
-typedef void (*CompletionCb)(std::shared_ptr<WinHttpRequestImp>, DWORD status);
+#define CURL_BAILOUT_ONERROR(res, request, retval)                                         \
+    if ((res) != CURLE_OK)                                                                 \
+    {                                                                                      \
+        TRACE("%-35s:%-8d:%-16p res:%d\n", __func__, __LINE__, (void*)(request), (res));   \
+        return (retval);                                                                   \
+    }
+
+typedef void (*CompletionCb)(std::shared_ptr<WinHttpRequestImp> &, DWORD status);
 
 #define MUTEX_TYPE                              std::mutex
 #define MUTEX_SETUP(x)
@@ -194,13 +244,6 @@ static inline THREAD_HANDLE CREATETHREAD(LPTHREAD_START_ROUTINE func, LPVOID par
 }
 #endif
 
-void handle_error(const char *file, int lineno, const char *msg)
-{
-    fprintf(stderr, "** %s:%d %s\n", file, lineno, msg);
-    ERR_print_errors_fp(stderr);
-    /* exit(-1); */
-}
-
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 /* This array will store all of the mutexes available to OpenSSL. */
 static MUTEX_TYPE *mutex_buf = NULL;
@@ -213,13 +256,13 @@ static void locking_function(int mode, int n, const char *file, int line)
         MUTEX_UNLOCK(mutex_buf[n]);
 }
 
-static unsigned long id_function(void)
+static unsigned long id_function()
 {
-    return ((unsigned long)(THREAD_ID));
+    return static_cast<unsigned long>(THREAD_ID);
 }
 #endif
 
-int thread_setup(void)
+static int thread_setup()
 {
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
     int i;
@@ -235,7 +278,7 @@ int thread_setup(void)
     return 1;
 }
 
-int thread_cleanup(void)
+static int thread_cleanup()
 {
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
     int i;
@@ -300,11 +343,11 @@ public:
         bool allocate,
         CompletionCb completion);
     ~UserCallbackContext();
-    std::shared_ptr<WinHttpRequestImp> GetRequestRef() { return m_request; }
+    std::shared_ptr<WinHttpRequestImp> &GetRequestRef() { return m_request; }
     WinHttpRequestImp *GetRequest() { return m_request.get(); }
-    DWORD GetInternetStatus() { return m_dwInternetStatus; }
-    DWORD GetStatusInformationLength() { return m_dwStatusInformationLength; }
-    DWORD GetNotificationFlags() { return m_dwNotificationFlags; }
+    DWORD GetInternetStatus() const { return m_dwInternetStatus; }
+    DWORD GetStatusInformationLength() const { return m_dwStatusInformationLength; }
+    DWORD GetNotificationFlags() const { return m_dwNotificationFlags; }
     WINHTTP_STATUS_CALLBACK &GetCb() { return m_cb; }
     CompletionCb &GetRequestCompletionCb() { return m_requestCompletionCb; }
     LPVOID GetUserdata() { return m_userdata; }
@@ -314,20 +357,21 @@ public:
         else
             return m_StatusInformationVal;
     }
-    BOOL GetStatusInformationValid() { return m_AsyncResultValid; }
+    BOOL GetStatusInformationValid() const { return m_AsyncResultValid; }
+
+private:
+    UserCallbackContext(const UserCallbackContext&);
+    UserCallbackContext& operator=(const UserCallbackContext&);
 };
 
 static void ConvertCstrAssign(const TCHAR *lpstr, size_t cLen, std::string &target)
 {
-    size_t bLen = cLen;
-
 #ifdef UNICODE
     std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
     target = conv.to_bytes(std::wstring(lpstr, cLen));
 #else
     target.assign(lpstr, cLen);
 #endif
-    target[bLen] = '\0';
 }
 
 static std::vector<std::string> Split(std::string &str, char delimiter) {
@@ -340,22 +384,6 @@ static std::vector<std::string> Split(std::string &str, char delimiter) {
     }
 
     return internal;
-}
-
-static void ReplaceStr(std::string &str, const char *searchStr, const char *replaceStr)
-{
-    size_t index = 0;
-    while (true) {
-        /* Locate the substring to replace. */
-        index = str.find(searchStr, index);
-        if (index == std::string::npos) break;
-
-        /* Make the replacement. */
-        str.replace(index, strlen(searchStr), replaceStr);
-
-        /* Advance index forward so the next iteration doesn't pick it up as well. */
-        index += strlen(searchStr);
-    }
 }
 
 static BOOL SizeCheck(LPVOID lpBuffer, LPDWORD lpdwBufferLength, DWORD Required)
@@ -378,6 +406,12 @@ static BOOL SizeCheck(LPVOID lpBuffer, LPDWORD lpdwBufferLength, DWORD Required)
     if ((Required == 0) || (lpdwBufferLength && (*lpdwBufferLength == 0)))
         return FALSE;
 
+    if (!lpBuffer)
+        return FALSE;
+
+    if (lpdwBufferLength && (*lpdwBufferLength < Required))
+        return FALSE;
+
     return TRUE;
 }
 
@@ -398,6 +432,9 @@ public:
 
     BOOL SetUserData(void **data)
     {
+        if (!data)
+            return FALSE;
+
         m_UserBuffer = *data;
         return TRUE;
     }
@@ -406,19 +443,42 @@ public:
 
 struct BufferRequest
 {
-    LPCVOID m_Buffer = NULL;
+    LPVOID m_Buffer = NULL;
     size_t  m_Length = 0;
+    size_t  m_Used = 0;
 };
+
+static void QueueBufferRequest(std::vector<BufferRequest> &store, LPVOID buffer, size_t length)
+{
+    BufferRequest shr;
+    shr.m_Buffer = buffer;
+    shr.m_Length = length;
+    shr.m_Used = 0;
+    store.push_back(shr);
+}
+
+static BufferRequest GetBufferRequest(std::vector<BufferRequest> &store)
+{
+    if (store.empty())
+        return BufferRequest();
+    BufferRequest shr = store.front();
+    store.erase(store.begin());
+    return shr;
+}
+
+static BufferRequest &PeekBufferRequest(std::vector<BufferRequest> &store)
+{
+    return store.front();
+}
 
 class WinHttpRequestImp :public WinHttpBase, public std::enable_shared_from_this<WinHttpRequestImp>
 {
     CURL *m_curl = NULL;
     std::vector<BYTE> m_ResponseString;
-    std::string m_HeaderString = "";
-    size_t m_TotalHeaderStringLength = 0;
-    std::string m_Header = "";
-    std::string m_FullPath = "";
-    std::string m_OptionalData = "";
+    std::string m_HeaderString;
+    std::string m_Header;
+    std::string m_FullPath;
+    std::string m_OptionalData;
     size_t m_TotalSize = 0;
     size_t m_TotalReceiveSize = 0;
     std::vector<BYTE> m_ReadData;
@@ -431,7 +491,7 @@ class WinHttpRequestImp :public WinHttpBase, public std::enable_shared_from_this
     DWORD m_SecureProtocol = 0;
     DWORD m_MaxConnections = 0;
 
-    std::string m_Type = "";
+    std::string m_Type;
     LPVOID m_UserBuffer = NULL;
     bool m_HeaderReceiveComplete = false;
 
@@ -440,29 +500,19 @@ class WinHttpRequestImp :public WinHttpBase, public std::enable_shared_from_this
     std::mutex m_HeaderStringMutex;
     std::mutex m_BodyStringMutex;
 
-    std::condition_variable m_CompletionEvent;
-    std::mutex m_CompletionEventMtx;
-    bool m_CompletionEventState = false;
-
-    std::condition_variable m_QueryDataEvent;
     std::mutex m_QueryDataEventMtx;
     bool m_QueryDataEventState = false;
     std::atomic<bool> m_QueryDataPending;
 
-    std::condition_variable m_ReceiveCompletionEvent;
     std::mutex m_ReceiveCompletionEventMtx;
-    std::atomic<DWORD> m_ReceiveCompletionEventCounter;
 
     std::mutex m_ReceiveResponseMutex;
     std::atomic<bool> m_ReceiveResponsePending;
     std::atomic<int> m_ReceiveResponseEventCounter;
-    int m_ReceiveResponseSendCounter;
+    int m_ReceiveResponseSendCounter = 0;
 
     std::atomic<bool> m_RedirectPending;
 
-    std::condition_variable m_DataAvailable;
-    std::mutex m_DataAvailableMtx;
-    std::atomic<DWORD> m_DataAvailableEventCounter;
     bool m_closing = false;
     bool m_closed = false;
     bool m_Completion = false;
@@ -470,41 +520,33 @@ class WinHttpRequestImp :public WinHttpBase, public std::enable_shared_from_this
     CURLcode m_CompletionCode = CURLE_OK;
     long m_VerifyPeer = 1;
     long m_VerifyHost = 2;
+    bool m_Uploading = false;
 
     WINHTTP_STATUS_CALLBACK m_InternetCallback = NULL;
     DWORD m_NotificationFlags = 0;
     std::vector<BufferRequest> m_OutstandingWrites;
+    std::vector<BufferRequest> m_OutstandingReads;
+    bool m_Secure = false;
 
 public:
-    void QueueWriteRequest(LPCVOID buffer, size_t length)
-    {
-        BufferRequest shr;
-        shr.m_Buffer = buffer;
-        shr.m_Length = length;
-        m_OutstandingWrites.push_back(shr);
-    }
-
-    BufferRequest GetWriteRequest()
-    {
-        if (m_OutstandingWrites.empty())
-            return BufferRequest();
-        BufferRequest shr = m_OutstandingWrites.front();
-        m_OutstandingWrites.pop_back();
-        return shr;
-    }
+    bool &GetSecure() { return m_Secure; }
+    std::vector<BufferRequest> &GetOutstandingWrites() { return m_OutstandingWrites; }
+    std::vector<BufferRequest> &GetOutstandingReads() { return m_OutstandingReads; }
 
     long &VerifyPeer() { return m_VerifyPeer; }
     long &VerifyHost() { return m_VerifyHost; }
 
     static size_t WriteHeaderFunction(void *ptr, size_t size, size_t nmemb, void* rqst);
     static size_t WriteBodyFunction(void *ptr, size_t size, size_t nmemb, void* rqst);
+    void ConsumeIncoming(std::shared_ptr<WinHttpRequestImp> &srequest, void* &ptr, size_t &available, size_t &read);
     void SetCallback(WINHTTP_STATUS_CALLBACK lpfnInternetCallback, DWORD dwNotificationFlags) {
         m_InternetCallback = lpfnInternetCallback;
         m_NotificationFlags = dwNotificationFlags;
     }
     WINHTTP_STATUS_CALLBACK GetCallback(DWORD *dwNotificationFlags)
     {
-        *dwNotificationFlags = m_NotificationFlags;
+        if (dwNotificationFlags)
+            *dwNotificationFlags = m_NotificationFlags;
         return m_InternetCallback;
     }
 
@@ -515,14 +557,12 @@ public:
 
     bool &GetQueryDataEventState() { return m_QueryDataEventState; }
     std::mutex &GetQueryDataEventMtx() { return m_QueryDataEventMtx; }
-    std::condition_variable &GetQueryDataEvent() { return m_QueryDataEvent; }
 
-    bool HandleQueryDataNotifications(std::shared_ptr<WinHttpRequestImp>, size_t available);
-    void WaitAsyncQueryDataCompletion(std::shared_ptr<WinHttpRequestImp>);
+    bool HandleQueryDataNotifications(std::shared_ptr<WinHttpRequestImp> &, size_t available);
+    void WaitAsyncQueryDataCompletion(std::shared_ptr<WinHttpRequestImp> &);
 
-    void HandleReceiveNotifications(std::shared_ptr<WinHttpRequestImp>);
-    void WaitAsyncReceiveCompletion(std::shared_ptr<WinHttpRequestImp> srequest);
-    size_t WaitDataAvailable();
+    void HandleReceiveNotifications(std::shared_ptr<WinHttpRequestImp> &srequest);
+    void WaitAsyncReceiveCompletion(std::shared_ptr<WinHttpRequestImp> &srequest);
 
     CURLcode &GetCompletionCode() { return m_CompletionCode; }
     bool &GetCompletionStatus() { return m_Completion; }
@@ -541,20 +581,19 @@ public:
     static THREADRETURN UploadThreadFunction(THREADPARAM lpThreadParameter)
     {
         WinHttpRequestImp *request = static_cast<WinHttpRequestImp *>(lpThreadParameter);
+        if (!request)
+            return NULL;
+
         CURL *curl = request->GetCurl();
         CURLcode res;
 
-        TRACE("%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
         /* Perform the request, res will get the return code */
         res = curl_easy_perform(curl);
         /* Check for errors */
-        if (res != CURLE_OK)
-        {
-            TRACE("curl_easy_perform() failed: %s\n",
-                curl_easy_strerror(res));
-            return FALSE;
-        }
-        TRACE("%s:%d res:%d\n", __func__, __LINE__, res);
+        CURL_BAILOUT_ONERROR(res, request, NULL);
+
+        TRACE("%-35s:%-8d:%-16p res:%d\n", __func__, __LINE__, (void*)request, res);
         request->GetUploadThreadExitStatus() = true;
 
     #if OPENSSL_VERSION_NUMBER >= 0x10000000L && OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -569,18 +608,7 @@ public:
     std::mutex &GetReadDataEventMtx() { return m_ReadDataEventMtx; }
     DWORD &GetReadDataEventCounter() { return m_ReadDataEventCounter; }
 
-    // sent by WriteHeaderFunction and WriteBodyFunction during incoming data
-    // to send user notifications for the following events:
-    //
-    // WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE
-    // WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED
-    // WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE
-    //
-    // WinHttpReceiveResponse is blocked until one of the above events happen
-    //
-    std::condition_variable &GetReceiveCompletionEvent() { return m_ReceiveCompletionEvent; }
     std::mutex &GetReceiveCompletionEventMtx() { return m_ReceiveCompletionEventMtx; }
-    std::atomic<DWORD> &GetReceiveCompletionEventCounter() { return m_ReceiveCompletionEventCounter; }
 
     // counters used to see which one of these events are observed: ResponseCallbackEventCounter
     // counters used to see which one of these events are broadcasted: ResponseCallbackSendCounter
@@ -596,21 +624,20 @@ public:
 
     std::atomic<bool> &GetRedirectPending() { return m_RedirectPending; }
 
-    std::condition_variable &GetDataAvailableEvent() { return m_DataAvailable; }
-    std::mutex &GetDataAvailableMtx() { return m_DataAvailableMtx; }
-    std::atomic<DWORD> &GetDataAvailableEventCounter() { return m_DataAvailableEventCounter; }
-
     std::mutex &GetHeaderStringMutex() { return m_HeaderStringMutex; }
     std::mutex &GetBodyStringMutex() { return m_HeaderStringMutex; }
 
     BOOL AsyncQueue(std::shared_ptr<WinHttpRequestImp> &,
                     DWORD dwInternetStatus, size_t statusInformationLength,
-                    LPVOID async, DWORD asyncLength, bool allocate);
+            LPVOID statusInformation, DWORD statusInformationCopySize, bool allocate);
 
     void SetHeaderReceiveComplete() { m_HeaderReceiveComplete = TRUE; }
 
     BOOL SetSecureProtocol(DWORD *data)
     {
+        if (!data)
+            return FALSE;
+
         m_SecureProtocol = *data;
         return TRUE;
     }
@@ -618,6 +645,9 @@ public:
 
     BOOL SetMaxConnections(DWORD *data)
     {
+        if (!data)
+            return FALSE;
+
         m_MaxConnections = *data;
         return TRUE;
     }
@@ -625,6 +655,9 @@ public:
 
     BOOL SetUserData(void **data)
     {
+        if (!data)
+            return FALSE;
+
         m_UserBuffer = *data;
         return TRUE;
     }
@@ -637,6 +670,7 @@ public:
     }
     std::string &GetFullPath() { return m_FullPath; }
     std::string &GetType() { return m_Type; }
+    bool &Uploading() { return m_Uploading; }
 
     void SetSession(WinHttpConnectImp *connect) { m_Session = connect; }
     WinHttpConnectImp *GetSession() { return m_Session; }
@@ -657,7 +691,6 @@ public:
     }
 
     std::vector<BYTE> &GetResponseString() { return m_ResponseString; }
-    size_t &GetTotalHeaderStringLength() { return m_TotalHeaderStringLength; }
     std::string &GetHeaderString() { return m_HeaderString; }
     CURL *GetCurl() { return m_curl; }
 
@@ -671,8 +704,7 @@ public:
             CURLcode res;
 
             res = curl_easy_setopt(GetCurl(), CURLOPT_PROXY, urlstr.c_str());
-            if (res != CURLE_OK)
-                return FALSE;
+            CURL_BAILOUT_ONERROR(res, this, FALSE);
         }
 
         return TRUE;
@@ -683,12 +715,10 @@ public:
         CURLcode res;
 
         res = curl_easy_setopt(GetCurl(), CURLOPT_URL, ServerName.c_str());
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, this, FALSE);
 
         res = curl_easy_setopt(GetCurl(), CURLOPT_PORT, nServerPort);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, this, FALSE);
 
         return TRUE;
     }
@@ -697,9 +727,13 @@ public:
     size_t &GetReadLength() { return m_TotalReceiveSize; }
 
     std::string &GetOptionalData() { return m_OptionalData; }
-    void SetOptionalData(void *lpOptional, size_t dwOptionalLength)
+    BOOL SetOptionalData(void *lpOptional, size_t dwOptionalLength)
     {
-        m_OptionalData.assign(&(reinterpret_cast<char*>(lpOptional))[0], dwOptionalLength);
+        if (!lpOptional || !dwOptionalLength)
+            return FALSE;
+
+        m_OptionalData.assign(&(static_cast<char*>(lpOptional))[0], dwOptionalLength);
+        return TRUE;
     }
 
     std::vector<BYTE> &GetReadData() { return m_ReadData; }
@@ -707,7 +741,7 @@ public:
     void AppendReadData(const void *data, size_t len)
     {
         std::lock_guard<std::mutex> lck(GetReadDataEventMtx());
-        m_ReadData.insert(m_ReadData.end(), reinterpret_cast<const BYTE*>(data), reinterpret_cast<const BYTE*>(data) + len);
+        m_ReadData.insert(m_ReadData.end(), static_cast<const BYTE*>(data), static_cast<const BYTE*>(data) + len);
     }
 
     static int SocketCallback(CURL *handle, curl_infotype type,
@@ -741,7 +775,7 @@ class UserCallbackContainer
 
 public:
 
-    bool GetClosing() { return m_closing; }
+    bool GetClosing() const { return m_closing; }
 
     UserCallbackContext* GetNext()
     {
@@ -758,13 +792,16 @@ public:
 
     static THREADRETURN UserCallbackThreadFunction(LPVOID lpThreadParameter);
 
-    void Queue(UserCallbackContext *ctx)
+    BOOL Queue(UserCallbackContext *ctx)
     {
+        if (!ctx)
+            return FALSE;
+
         {
             std::lock_guard<std::mutex> lck(m_MapMutex);
 
-            TRACE_VERBOSE("%s:%d ctx = %p cb = %p userdata = %p dwInternetStatus = %p\n",
-                __func__, __LINE__, reinterpret_cast<void*>(ctx), reinterpret_cast<void*>(ctx->GetCb()),
+            TRACE_VERBOSE("%-35s:%-8d:%-16p ctx = %p cb = %p userdata = %p dwInternetStatus = %p\n",
+                __func__, __LINE__, (void*)ctx->GetRequest(), reinterpret_cast<void*>(ctx), reinterpret_cast<void*>(ctx->GetCb()),
                 ctx->GetUserdata(), ctx->GetStatusInformation());
             GetCallbackQueue().push_back(ctx);
         }
@@ -773,11 +810,12 @@ public:
             m_EventCounter++;
             m_hEvent.notify_all();
         }
+        return TRUE;
     }
 
     void DrainQueue()
     {
-        while (1)
+        while (true)
         {
             m_MapMutex.lock();
             UserCallbackContext *ctx = GetNext();
@@ -815,6 +853,9 @@ public:
         static UserCallbackContainer the_instance;
         return the_instance;
     }
+private:
+    UserCallbackContainer(const UserCallbackContainer&);
+    UserCallbackContainer& operator=(const UserCallbackContainer&);
 };
 
 class EnvInit
@@ -823,10 +864,10 @@ public:
     EnvInit()
     {
         if (const char* env_p = std::getenv("WINHTTP_PAL_DEBUG"))
-            winhttp_tracing = atoi(env_p);
+            winhttp_tracing = std::stoi(std::string(env_p));
 
         if (const char* env_p = std::getenv("WINHTTP_PAL_DEBUG_VERBOSE"))
-            winhttp_tracing_verbose = atoi(env_p);
+            winhttp_tracing_verbose = std::stoi(std::string(env_p));
     }
 };
 
@@ -848,7 +889,7 @@ class ComContainer
     BOOL m_closing = FALSE;
 
     // used to protect CURLM data structures
-    BOOL GetThreadClosing() { return m_closing; }
+    BOOL GetThreadClosing() const { return m_closing; }
 
 public:
     CURL *AllocCURL()
@@ -885,7 +926,7 @@ public:
         m_MultiMutex.unlock();
     }
 
-    BOOL AddHandle(std::shared_ptr<WinHttpRequestImp> srequest, CURL *handle)
+    BOOL AddHandle(std::shared_ptr<WinHttpRequestImp> &srequest, CURL *handle)
     {
         CURLMcode mres = CURLM_OK;
 
@@ -917,7 +958,7 @@ public:
 
         return TRUE;
     }
-    BOOL RemoveHandle(std::shared_ptr<WinHttpRequestImp> srequest, CURL *handle, bool clearPrivate)
+    BOOL RemoveHandle(std::shared_ptr<WinHttpRequestImp> &srequest, CURL *handle, bool clearPrivate)
     {
         CURLMcode mres;
 
@@ -972,7 +1013,7 @@ public:
 
     ~ComContainer()
     {
-        TRACE("==>%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)this);
         m_closing = true;
         {
             std::lock_guard<std::mutex> lck(m_hAsyncEventMtx);
@@ -980,7 +1021,7 @@ public:
             m_hAsyncEvent.notify_all();
         }
         THREADJOIN(m_hAsyncThread);
-        TRACE("<==%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)this);
 
         curl_multi_cleanup(m_curlm);
         curl_global_cleanup();
@@ -992,6 +1033,9 @@ public:
 
     int QueryData(int *still_running)
     {
+        if (!still_running)
+            return 0;
+
         int rc = 0;
         struct timeval timeout;
 
@@ -1053,6 +1097,9 @@ public:
 
         return rc;
     }
+private:
+    ComContainer(const ComContainer&);
+    ComContainer& operator=(const ComContainer&);
 };
 
 template<class T>
@@ -1075,7 +1122,7 @@ public:
         bool found = false;
         std::lock_guard<std::mutex> lck(m_ActiveRequestMtx);
 
-        TRACE("%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)val);
 
         for (auto it = m_ActiveRequests.begin(); it != m_ActiveRequests.end(); ++it)
         {
@@ -1105,14 +1152,14 @@ public:
                 break;
             }
         }
-        TRACE("%s:%d found:%d\n", __func__, __LINE__, found);
+        TRACE("%-35s:%-8d:%-16p found:%d\n", __func__, __LINE__, (void*)val, found);
 
         return found;
     }
 
     void Register(std::shared_ptr<T> rqst)
     {
-        TRACE("%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)(rqst.get()));
         std::lock_guard<std::mutex> lck(m_ActiveRequestMtx);
         m_ActiveRequests.push_back(rqst);
     }
@@ -1120,10 +1167,10 @@ public:
 
 class WinHttpSessionImp :public WinHttpBase
 {
-    std::string m_ServerName = "";
-    std::string m_Referrer = "";
+    std::string m_ServerName;
+    std::string m_Referrer;
     std::vector<std::string> m_Proxies;
-    std::string m_Proxy = "";
+    std::string m_Proxy;
     WINHTTP_STATUS_CALLBACK m_InternetCallback = NULL;
     DWORD m_NotificationFlags = 0;
 
@@ -1140,6 +1187,9 @@ public:
 
     BOOL SetUserData(void **data)
     {
+        if (!data)
+            return FALSE;
+
         m_UserBuffer = *data;
         return TRUE;
     }
@@ -1147,32 +1197,38 @@ public:
 
     BOOL SetSecureProtocol(DWORD *data)
     {
+        if (!data)
+            return FALSE;
+
         m_SecureProtocol = *data;
         return TRUE;
     }
-    DWORD GetSecureProtocol() { return m_SecureProtocol; }
+    DWORD GetSecureProtocol() const { return m_SecureProtocol; }
 
     BOOL SetMaxConnections(DWORD *data)
     {
+        if (!data)
+            return FALSE;
+
         m_MaxConnections = *data;
         return TRUE;
     }
-    DWORD GetMaxConnections() { return m_MaxConnections; }
+    DWORD GetMaxConnections() const { return m_MaxConnections; }
 
     void SetAsync() { m_Async = TRUE; }
-    BOOL GetAsync() { return m_Async; }
+    BOOL GetAsync() const { return m_Async; }
 
-    BOOL GetThreadClosing() { return m_closing; }
+    BOOL GetThreadClosing() const { return m_closing; }
 
     std::vector<std::string> &GetProxies() { return m_Proxies; }
     void SetProxies(std::vector<std::string> &proxies) { m_Proxies = proxies; }
 
     std::string &GetProxy() { return m_Proxy; }
 
-    int GetServerPort() { return m_ServerPort; }
+    int GetServerPort() const { return m_ServerPort; }
     void SetServerPort(int port) { m_ServerPort = port; }
 
-    long GetTimeout() {
+    long GetTimeout() const {
         if (m_Timeout)
             return m_Timeout;
 
@@ -1197,19 +1253,16 @@ public:
     }
     WINHTTP_STATUS_CALLBACK GetCallback(DWORD *dwNotificationFlags)
     {
-        *dwNotificationFlags = m_NotificationFlags;
+        if (dwNotificationFlags)
+            *dwNotificationFlags = m_NotificationFlags;
         return m_InternetCallback;
-    }
-
-    WinHttpSessionImp()
-    {
     }
 
     ~WinHttpSessionImp()
     {
-        TRACE("==>%s:%d sesion\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p sesion\n", __func__, __LINE__, (void*)this);
         SetCallback(NULL, 0);
-        TRACE("<==%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)this);
     }
 };
 
@@ -1217,7 +1270,7 @@ THREADRETURN ComContainer::AsyncThreadFunction(LPVOID lpThreadParameter)
 {
     ComContainer *comContainer = static_cast<ComContainer *>(lpThreadParameter);
 
-    while (1)
+    while (true)
     {
         {
             std::unique_lock<std::mutex> getAsyncEventHndlMtx(comContainer->m_hAsyncEventMtx);
@@ -1236,7 +1289,7 @@ THREADRETURN ComContainer::AsyncThreadFunction(LPVOID lpThreadParameter)
 
             comContainer->QueryData(&still_running);
 
-            //TRACE("%s:%d\n", __func__, __LINE__);
+            //TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
             struct CURLMsg *m;
 
             /* call curl_multi_perform or curl_multi_socket_action first, then loop
@@ -1261,63 +1314,61 @@ THREADRETURN ComContainer::AsyncThreadFunction(LPVOID lpThreadParameter)
                     WINHTTP_ASYNC_RESULT result = { 0, 0 };
                     DWORD dwInternetStatus;
 
-                    TRACE("%s:%d type:%s result:%d\n", __func__, __LINE__, request->GetType().c_str(), m->data.result);
-                    request->GetCompletionStatus() = true;
+                    TRACE("%-35s:%-8d:%-16p type:%s result:%d\n", __func__, __LINE__, (void*)request, request->GetType().c_str(), m->data.result);
                     request->GetCompletionCode() = m->data.result;
-
-                    // unblock ReceiveResponse if waiting
-                    if (m->data.result != CURLE_OK)
-                    {
-                        std::lock_guard<std::mutex> lck(request->GetReceiveCompletionEventMtx());
-                        request->GetReceiveCompletionEventCounter()++;
-                        request->GetReceiveCompletionEvent().notify_all();
-                        TRACE("%s:%d GetReceiveCompletionEvent().notify_all\n", __func__, __LINE__);
-                    }
 
                     if (m->data.result == CURLE_OK)
                     {
                         if (request->HandleQueryDataNotifications(srequest, 0))
                         {
-                            TRACE("%s:%d GetQueryDataEvent().notify_all\n", __func__, __LINE__);
+                            TRACE("%-35s:%-8d:%-16p GetQueryDataEvent().notify_all\n", __func__, __LINE__, (void*)request);
                         }
                         {
                             std::lock_guard<std::mutex> lck(request->GetQueryDataEventMtx());
                             request->GetQueryDataEventState() = true;
-                            request->GetQueryDataEvent().notify_all();
                         }
                         request->HandleQueryDataNotifications(srequest, 0);
                     }
 
-                    if (m->data.result == CURLE_OK)
-                    {
-                        TRACE("%s:%d m->data.result:%d\n", __func__, __LINE__, m->data.result);
-                        std::lock_guard<std::mutex> lck(request->GetDataAvailableMtx());
-                        request->GetDataAvailableEventCounter()++;
-                        request->GetDataAvailableEvent().notify_all();
-                    }
+                    request->GetBodyStringMutex().lock();
+
+                    request->GetCompletionStatus() = true;
 
                     if (m->data.result == CURLE_OK)
                     {
+                        void *ptr = request->GetResponseString().data();
+                        size_t available = request->GetResponseString().size();
+                        size_t totalread = 0;
+                        request->ConsumeIncoming(srequest, ptr, available, totalread);
+                        if (totalread)
+                        {
+                            TRACE("%-35s:%-8d:%-16p consumed length:%lu\n", __func__, __LINE__, (void*)srequest.get(), totalread);
+                        }
                     }
                     else if (m->data.result == CURLE_OPERATION_TIMEDOUT)
                     {
                         result.dwError = ERROR_WINHTTP_TIMEOUT;
                         dwInternetStatus = WINHTTP_CALLBACK_STATUS_REQUEST_ERROR;
                         request->AsyncQueue(srequest, dwInternetStatus, 0, &result, sizeof(result), true);
-                        TRACE("request done type = %s CURLE_OPERATION_TIMEDOUT\n", request->GetType().c_str());
+                        TRACE("%-35s:%-8d:%-16p request done type = %s CURLE_OPERATION_TIMEDOUT\n",
+                              __func__, __LINE__, (void*)request, request->GetType().c_str());
                     }
                     else
                     {
                         result.dwError = ERROR_WINHTTP_OPERATION_CANCELLED;
                         dwInternetStatus = WINHTTP_CALLBACK_STATUS_REQUEST_ERROR;
-                        TRACE("unknown async request done m->data.result = %d\n", m->data.result);
+                        TRACE("%-35s:%-8d:%-16p unknown async request done m->data.result = %d\n",
+                              __func__, __LINE__, (void*)request, m->data.result);
 #ifdef _DEBUG
                         assert(0);
 #endif
                         request->AsyncQueue(srequest, dwInternetStatus, 0, &result, sizeof(result), true);
                     }
+
+                    request->GetBodyStringMutex().unlock();
+
                 } else if (m && (m->msg != CURLMSG_DONE)) {
-                    TRACE("%s\n", "unknown async request done\n");
+                    TRACE("%-35s:%-8d:%-16p unknown async request done\n", __func__, __LINE__, (void*)request);
                     DWORD dwInternetStatus;
                     WINHTTP_ASYNC_RESULT result = { 0, 0 };
                     result.dwError = ERROR_WINHTTP_OPERATION_CANCELLED;
@@ -1332,13 +1383,13 @@ THREADRETURN ComContainer::AsyncThreadFunction(LPVOID lpThreadParameter)
                 if (request)
                 {
                     comContainer->RemoveHandle(srequest, request->GetCurl(), true);
-                    TRACE("%s:%d\n", __func__, __LINE__);
+                    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
                 }
             } while (m);
         }
         if (comContainer->GetThreadClosing())
         {
-            TRACE("%s:%d %s\n", __func__, __LINE__, "exiting\n");
+            TRACE("%s:%d exiting\n", __func__, __LINE__);
             break;
         }
     }
@@ -1355,7 +1406,7 @@ THREADRETURN UserCallbackContainer::UserCallbackThreadFunction(LPVOID lpThreadPa
 {
     UserCallbackContainer *cbContainer = static_cast<UserCallbackContainer *>(lpThreadParameter);
 
-    while (1)
+    while (true)
     {
         {
             std::unique_lock<std::mutex> GetEventHndlMtx(cbContainer->m_hEventMtx);
@@ -1372,7 +1423,7 @@ THREADRETURN UserCallbackContainer::UserCallbackThreadFunction(LPVOID lpThreadPa
             break;
         }
 
-        while (1)
+        while (true)
         {
             cbContainer->m_MapMutex.lock();
             UserCallbackContext *ctx = NULL;
@@ -1384,11 +1435,11 @@ THREADRETURN UserCallbackContainer::UserCallbackThreadFunction(LPVOID lpThreadPa
             void *statusInformation = NULL;
 
             if (ctx->GetStatusInformationValid())
-                statusInformation = reinterpret_cast<void*>(ctx->GetStatusInformation());
+                statusInformation = ctx->GetStatusInformation();
 
             if (!ctx->GetRequestRef()->GetClosed() && ctx->GetCb()) {
-                TRACE_VERBOSE("%s:%d ctx = %p cb = %p ctx->GetUserdata() = %p dwInternetStatus:0x%lx statusInformation=%p refcount:%lu\n",
-                    __func__, __LINE__, reinterpret_cast<void*>(ctx), reinterpret_cast<void*>(ctx->GetCb()),
+                TRACE_VERBOSE("%-35s:%-8d:%-16p ctx = %p cb = %p ctx->GetUserdata() = %p dwInternetStatus:0x%lx statusInformation=%p refcount:%lu\n",
+                    __func__, __LINE__, (void*)ctx->GetRequest(), reinterpret_cast<void*>(ctx), reinterpret_cast<void*>(ctx->GetCb()),
                     ctx->GetUserdata(), ctx->GetInternetStatus(), statusInformation, ctx->GetRequestRef().use_count());
                 ctx->GetCb()(ctx->GetRequest(),
                     (DWORD_PTR)(ctx->GetUserdata()),
@@ -1396,6 +1447,9 @@ THREADRETURN UserCallbackContainer::UserCallbackThreadFunction(LPVOID lpThreadPa
                     statusInformation,
                     ctx->GetStatusInformationLength());
 
+                TRACE_VERBOSE("%-35s:%-8d:%-16p ctx = %p cb = %p ctx->GetUserdata() = %p dwInternetStatus:0x%lx statusInformation=%p refcount:%lu\n",
+                    __func__, __LINE__, (void*)ctx->GetRequest(), reinterpret_cast<void*>(ctx), reinterpret_cast<void*>(ctx->GetCb()),
+                    ctx->GetUserdata(), ctx->GetInternetStatus(), statusInformation, ctx->GetRequestRef().use_count());
             }
             ctx->GetRequestCompletionCb()(ctx->GetRequestRef(), ctx->GetInternetStatus());
             delete ctx;
@@ -1441,7 +1495,9 @@ WinHttpSessionImp *GetImp(WinHttpBase *base)
     }
     else if ((request = dynamic_cast<WinHttpRequestImp *>(base)))
     {
-        WinHttpConnectImp *connect = request->GetSession();
+        connect = request->GetSession();
+        if (!connect)
+            return NULL;
         session = connect->GetHandle();
     }
     else
@@ -1455,11 +1511,10 @@ WinHttpSessionImp *GetImp(WinHttpBase *base)
 
 UserCallbackContext::~UserCallbackContext()
 {
-    if (m_StatusInformation)
-        delete [] m_StatusInformation;
+    delete [] m_StatusInformation;
 }
 
-void WinHttpRequestImp::HandleReceiveNotifications(std::shared_ptr<WinHttpRequestImp> srequest)
+void WinHttpRequestImp::HandleReceiveNotifications(std::shared_ptr<WinHttpRequestImp> &srequest)
 {
     bool expected = true;
 
@@ -1469,8 +1524,8 @@ void WinHttpRequestImp::HandleReceiveNotifications(std::shared_ptr<WinHttpReques
         bool redirectPending;
         {
             expected = true;
-            redirectPending = std::atomic_compare_exchange_strong(&GetRedirectPending(), &expected, false);
-            TRACE("%s:%d redirectPending = %d ResponseCallbackSendCounter = %d\n", __func__, __LINE__,
+            redirectPending = GetRedirectPending();
+            TRACE("%-35s:%-8d:%-16p redirectPending = %d ResponseCallbackSendCounter = %d\n", __func__, __LINE__, (void*)this,
                     redirectPending, (int)ResponseCallbackSendCounter());
         }
         GetReceiveResponseMutex().lock();
@@ -1478,13 +1533,13 @@ void WinHttpRequestImp::HandleReceiveNotifications(std::shared_ptr<WinHttpReques
         {
             if (ResponseCallbackSendCounter() == 0)
             {
-                TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__);
+                TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__, (void*)this);
                 AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, 0, NULL, 0, false);
                 ResponseCallbackSendCounter()++;
             }
             if (ResponseCallbackSendCounter() == 1)
             {
-                TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED\n", __func__, __LINE__);
+                TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED\n", __func__, __LINE__, (void*)this);
                 AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, GetHeaderString().length(), NULL, 0, false);
                 ResponseCallbackSendCounter()++;
             }
@@ -1493,19 +1548,19 @@ void WinHttpRequestImp::HandleReceiveNotifications(std::shared_ptr<WinHttpReques
         }
         if (ResponseCallbackSendCounter() == (0 + redirectPending * 3))
         {
-            TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__);
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__, (void*)this);
             AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, 0, NULL, 0, false);
             ResponseCallbackSendCounter()++;
         }
         if (ResponseCallbackSendCounter() == (1 + redirectPending * 3))
         {
-            TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED\n", __func__, __LINE__);
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED\n", __func__, __LINE__, (void*)this);
             AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, GetHeaderString().length(), NULL, 0, false);
             ResponseCallbackSendCounter()++;
         }
-        if (ResponseCallbackSendCounter() == (2 + redirectPending * 3))
+        if ((ResponseCallbackSendCounter() == (2 + redirectPending * 3)) && (GetCompletionCode() == CURLE_OK))
         {
-            TRACE("%s:%d WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE\n", __func__, __LINE__);
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE\n", __func__, __LINE__, (void*)this);
             SetHeaderReceiveComplete();
             AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, 0, NULL, 0, false);
             ResponseCallbackSendCounter()++;
@@ -1516,151 +1571,136 @@ void WinHttpRequestImp::HandleReceiveNotifications(std::shared_ptr<WinHttpReques
 
 size_t WinHttpRequestImp::WriteHeaderFunction(void *ptr, size_t size, size_t nmemb, void* rqst) {
     WinHttpRequestImp *request = static_cast<WinHttpRequestImp *>(rqst);
+    if (!request)
+        return 0;
+
     std::shared_ptr<WinHttpRequestImp> srequest = request->shared_from_this();
     if (!srequest)
         return size * nmemb;
     bool EofHeaders = false;
 
+    TRACE("%-35s:%-8d:%-16p %zu\n", __func__, __LINE__, (void*)request, size * nmemb);
     {
         std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
 
-        if (request->GetAsync() && request->GetHeaderString().length() == 0) {
-            request->ResponseCallbackEventCounter()++;
-
-            if (request->GetReceiveResponsePending()) {
-                request->GetReceiveResponseMutex().lock();
-
-                if (request->ResponseCallbackSendCounter() == 0) {
-                    TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__);
-                    request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, 0, NULL, 0, false);
-                    request->ResponseCallbackSendCounter()++;
-                }
-                request->GetReceiveResponseMutex().unlock();
-            }
-        }
-
-        request->GetHeaderString().append(reinterpret_cast<char*>(ptr), size * nmemb);
-        request->GetTotalHeaderStringLength() += size * nmemb;
+        request->GetHeaderString().append(static_cast<char*>(ptr), size * nmemb);
 
         if (request->GetHeaderString().find("\r\n\r\n") != std::string::npos)
             EofHeaders = true;
         if (request->GetHeaderString().find("\n\n") != std::string::npos)
             EofHeaders = true;
-
-        if (request->GetAsync() && EofHeaders) {
-            request->ResponseCallbackEventCounter()++;
-
-            if (request->GetReceiveResponsePending())
-            {
-                request->GetReceiveResponseMutex().lock();
-
-                if (request->ResponseCallbackSendCounter() == 0)
-                {
-                    TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__);
-                    request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, 0, NULL, 0, false);
-                    request->ResponseCallbackSendCounter()++;
-                }
-                if (request->ResponseCallbackSendCounter() == 1)
-                {
-                    TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED\n", __func__, __LINE__);
-                    request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, request->GetHeaderString().length(), NULL, 0, false);
-                    request->ResponseCallbackSendCounter()++;
-                }
-                request->GetReceiveResponseMutex().unlock();
-            }
-        }
     }
     if (EofHeaders && request->GetAsync())
     {
         DWORD retValue;
 
         curl_easy_getinfo(request->GetCurl(), CURLINFO_RESPONSE_CODE, &retValue);
-        if (retValue == 302)
+        if ((retValue == 302) || (retValue == 301))
         {
             std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
             request->GetHeaderString() = "";
-            TRACE("%s:%d Redirect \n", __func__, __LINE__);
-            request->ResponseCallbackEventCounter()++;
+            TRACE("%-35s:%-8d:%-16p Redirect \n", __func__, __LINE__, (void*)request);
             request->GetRedirectPending() = true;
             return size * nmemb;
         }
 
-        request->ResponseCallbackEventCounter()++;
-        TRACE("%s:%d HandleReceiveNotifications \n", __func__, __LINE__);
-        request->HandleReceiveNotifications(srequest);
+        if (retValue != 100)
         {
             std::lock_guard<std::mutex> lck(request->GetReceiveCompletionEventMtx());
-            request->GetReceiveCompletionEventCounter()++;
-            request->GetReceiveCompletionEvent().notify_all();
-            TRACE("%s:%d GetReceiveCompletionEvent().notify_all\n", __func__, __LINE__);
+            request->ResponseCallbackEventCounter()++;
+            request->HandleReceiveNotifications(srequest);
+            TRACE("%-35s:%-8d:%-16p GetReceiveCompletionEvent().notify_all\n", __func__, __LINE__, (void*)request);
+        }
+        else
+        {
+            TRACE("%-35s:%-8d:%-16p retValue = %lu \n", __func__, __LINE__, (void*)request, retValue);
         }
 
     }
     return size * nmemb;
 }
 
+void WinHttpRequestImp::ConsumeIncoming(std::shared_ptr<WinHttpRequestImp> &srequest, void* &ptr, size_t &available, size_t &read)
+{
+    while (available)
+    {
+        BufferRequest buf = GetBufferRequest(srequest->GetOutstandingReads());
+        if (!buf.m_Length)
+            break;
+
+        size_t len = MIN(buf.m_Length, available);
+
+        if (len)
+        {
+            TRACE("%-35s:%-8d:%-16p reading length:%lu written:%lu %p %ld\n",
+                __func__, __LINE__, (void*)srequest.get(), len, read, buf.m_Buffer, buf.m_Length);
+            memcpy(static_cast<char*>(buf.m_Buffer), ptr, len);
+        }
+
+        ptr = static_cast<char*>(ptr) + len;
+        available -= len;
+
+        if (len)
+        {
+            LPVOID StatusInformation = buf.m_Buffer;
+
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_READ_COMPLETE lpBuffer: %p length:%lu\n", __func__, __LINE__, (void*)srequest.get(), buf.m_Buffer, len);
+            srequest->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, len, StatusInformation, sizeof(StatusInformation), false);
+        }
+
+        read += len;
+    }
+}
+
 size_t WinHttpRequestImp::WriteBodyFunction(void *ptr, size_t size, size_t nmemb, void* rqst) {
+    size_t read = 0;
     WinHttpRequestImp *request = static_cast<WinHttpRequestImp *>(rqst);
+    if (!request)
+        return 0;
+
     std::shared_ptr<WinHttpRequestImp> srequest = request->shared_from_this();
     if (!srequest)
-        return size * nmemb;
+        return 0;
 
     {
         std::lock_guard<std::mutex> lck(request->GetBodyStringMutex());
-        request->GetResponseString().insert(request->GetResponseString().end(),
-                                            reinterpret_cast<const BYTE*>(ptr),
-                                            reinterpret_cast<const BYTE*>(ptr) + size * nmemb);
+        void *buf = request->GetResponseString().data();
+        size_t available = request->GetResponseString().size();
+        size_t totalread = 0;
+
+        request->ConsumeIncoming(srequest, buf, available, totalread);
+        if (totalread)
+        {
+            TRACE("%-35s:%-8d:%-16p consumed length:%lu\n", __func__, __LINE__, (void*)srequest.get(), totalread);
+            request->GetReadLength() += totalread;
+            request->GetReadData().erase(request->GetReadData().begin(), request->GetReadData().begin() + totalread);
+            request->GetReadData().shrink_to_fit();
+        }
+    }
+
+    size_t available = size * nmemb;
+    {
+        std::lock_guard<std::mutex> lck(request->GetBodyStringMutex());
+        void *buf = ptr;
+
+        request->ConsumeIncoming(srequest, buf, available, read);
+
+        if (available)
+        {
+            request->GetResponseString().insert(request->GetResponseString().end(),
+                reinterpret_cast<const BYTE*>(buf),
+                reinterpret_cast<const BYTE*>(buf) + available);
+
+            read += available;
+        }
     }
 
     if (request->GetAsync()) {
-        bool expected = true;
-
-        bool result = std::atomic_compare_exchange_strong(&request->GetReceiveResponsePending(), &expected, false);
-
-        if (result) {
-            request->GetReceiveResponseMutex().lock();
-            if (request->ResponseCallbackSendCounter() == 0)
-            {
-                TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE\n", __func__, __LINE__);
-                request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, 0, NULL, 0, false);
-                request->ResponseCallbackSendCounter()++;
-            }
-
-            if (request->ResponseCallbackSendCounter() == 1)
-            {
-                TRACE("%s:%d WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED\n", __func__, __LINE__);
-                request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, request->GetHeaderString().length(), NULL, 0, false);
-                request->ResponseCallbackSendCounter()++;
-            }
-
-            if (request->ResponseCallbackSendCounter() == 2)
-            {
-                TRACE("%s:%d WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE\n", __func__, __LINE__);
-                request->SetHeaderReceiveComplete();
-                request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, 0, NULL, 0, false);
-                request->ResponseCallbackSendCounter()++;
-            }
-            {
-                std::lock_guard<std::mutex> lck(request->GetReceiveCompletionEventMtx());
-                request->GetReceiveCompletionEventCounter()++;
-                request->GetReceiveCompletionEvent().notify_all();
-                TRACE("%s:%d GetReceiveCompletionEvent().notify_all\n", __func__, __LINE__);
-            }
-            request->GetReceiveResponseMutex().unlock();
-        }
-
-        {
-            std::lock_guard<std::mutex> lck(request->GetDataAvailableMtx());
-            request->GetDataAvailableEventCounter()++;
-            request->GetDataAvailableEvent().notify_all();
-            TRACE_VERBOSE("%s:%d data available:%lu\n", __func__, __LINE__, size * nmemb);
-        }
-
-        if (request->HandleQueryDataNotifications(srequest, size * nmemb))
-            TRACE("%s:%d GetQueryDataEvent().notify_all\n", __func__, __LINE__);
+        if (available && request->HandleQueryDataNotifications(srequest, available))
+            TRACE("%-35s:%-8d:%-16p GetQueryDataEvent().notify_all\n", __func__, __LINE__, (void*)request);
     }
 
-    return size * nmemb;
+    return read;
 }
 
 void WinHttpRequestImp::CleanUp()
@@ -1668,45 +1708,39 @@ void WinHttpRequestImp::CleanUp()
     m_CompletionCode = CURLE_OK;
     m_ResponseString.clear();
     m_HeaderString.clear();
-    m_TotalHeaderStringLength = 0;
     m_TotalReceiveSize = 0;
     m_ReadData.clear();
     m_ReadDataEventCounter = 0;
     m_UploadThreadExitStatus = false;
-    m_ReceiveCompletionEventCounter = 0;
-    m_CompletionEventState = false;
     m_QueryDataPending = false;
     m_ReceiveResponsePending = false;
     m_RedirectPending = false;
     m_ReceiveResponseEventCounter = 0;
     m_ReceiveResponseSendCounter = 0;
-    m_DataAvailableEventCounter = 0;
     m_OutstandingWrites.clear();
+    m_OutstandingReads.clear();
     m_Completion = false;
 }
 
 WinHttpRequestImp::WinHttpRequestImp():
+            m_UploadCallbackThread(),
             m_QueryDataPending(false),
-            m_ReceiveCompletionEventCounter(0),
             m_ReceiveResponsePending(false),
             m_ReceiveResponseEventCounter(0),
-            m_ReceiveResponseSendCounter(0),
-            m_RedirectPending(false),
-            m_DataAvailableEventCounter(0)
+            m_RedirectPending(false)
 {
     m_curl = ComContainer::GetInstance().AllocCURL();
     if (!m_curl)
         return;
-    return;
 }
 
 WinHttpRequestImp::~WinHttpRequestImp()
 {
-    TRACE("==>%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)this);
 
     m_closed = true;
 
-    if (!GetAsync() && (GetType() == "PUT"))
+    if (!GetAsync() && Uploading())
     {
         {
             std::lock_guard<std::mutex> lck(GetReadDataEventMtx());
@@ -1716,7 +1750,7 @@ WinHttpRequestImp::~WinHttpRequestImp()
     }
 
     if (GetAsync()) {
-            TRACE("%s:%d\n", __func__, __LINE__);
+            TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)this);
     }
     else
         curl_easy_getinfo(GetCurl(), CURLINFO_PRIVATE, NULL);
@@ -1728,14 +1762,14 @@ WinHttpRequestImp::~WinHttpRequestImp()
     if (m_HeaderList)
         curl_slist_free_all(m_HeaderList);
 
-    TRACE("<==%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)this);
 }
 
-static void RequestCompletionCb(std::shared_ptr<WinHttpRequestImp> requestRef, DWORD status)
+static void RequestCompletionCb(std::shared_ptr<WinHttpRequestImp> &requestRef, DWORD status)
 {
     if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING)
     {
-        TRACE_VERBOSE("%s:%d status:0x%lx\n", __func__, __LINE__, status);
+        TRACE_VERBOSE("%-35s:%-8d:%-16p status:0x%lx\n", __func__, __LINE__, (void*)(requestRef.get()), status);
         requestRef->GetClosed() = true;
     }
 }
@@ -1750,11 +1784,10 @@ BOOL WinHttpRequestImp::AsyncQueue(std::shared_ptr<WinHttpRequestImp> &requestRe
     WINHTTP_STATUS_CALLBACK cb = GetCallback(&dwNotificationFlags);
     LPVOID userdata = NULL;
 
-    if (this->GetUserData())
-        userdata = (LPVOID)GetUserData();
+    userdata = GetUserData();
 
-    ctx = new UserCallbackContext(requestRef, dwInternetStatus, (DWORD)statusInformationLength,
-                                    dwNotificationFlags, cb, userdata, (LPVOID)statusInformation,
+    ctx = new UserCallbackContext(requestRef, dwInternetStatus, static_cast<DWORD>(statusInformationLength),
+                                    dwNotificationFlags, cb, userdata, statusInformation,
                                     statusInformationCopySize, allocate, RequestCompletionCb);
     if (ctx) {
         UserCallbackContainer::GetInstance().Queue(ctx);
@@ -1774,14 +1807,14 @@ size_t WinHttpRequestImp::ReadCallback(void *ptr, size_t size, size_t nmemb, voi
     if (!srequest)
         return size * nmemb;
 
-    size_t len;
+    size_t len = 0;
 
     TRACE("request->GetTotalLength(): %lu\n", request->GetTotalLength());
     if (request->GetOptionalData().length() > 0)
     {
-        len = request->GetOptionalData().length();
-        TRACE("%s:%d writing optional length of %lu\n", __func__, __LINE__, len);
-        std::copy(request->GetOptionalData().begin(), request->GetOptionalData().end(), (char*)ptr);
+        len = MIN(request->GetOptionalData().length(), size * nmemb);
+        TRACE("%-35s:%-8d:%-16p writing optional length of %lu\n", __func__, __LINE__, (void*)request, len);
+        std::copy(request->GetOptionalData().begin(), request->GetOptionalData().end(), static_cast<char*>(ptr));
         request->GetOptionalData().erase(0, len);
         request->GetReadLength() += len;
         return len;
@@ -1790,52 +1823,68 @@ size_t WinHttpRequestImp::ReadCallback(void *ptr, size_t size, size_t nmemb, voi
     if (request->GetClosed())
         return -1;
 
-    TRACE("%s:%d request->GetTotalLength():%lu request->GetReadLength():%lu\n", __func__, __LINE__, request->GetTotalLength(), request->GetReadLength());
-    if (((request->GetTotalLength() == 0) && (request->GetOptionalData().length() == 0) && (request->GetType() == "PUT")) ||
+    TRACE("%-35s:%-8d:%-16p request->GetTotalLength():%lu request->GetReadLength():%lu\n", __func__, __LINE__, (void*)request, request->GetTotalLength(), request->GetReadLength());
+    if (((request->GetTotalLength() == 0) && (request->GetOptionalData().length() == 0) && request->Uploading()) ||
         (request->GetTotalLength() != request->GetReadLength()))
     {
         std::unique_lock<std::mutex> getReadDataEventHndlMtx(request->GetReadDataEventMtx());
         if (!request->GetReadDataEventCounter())
         {
-            TRACE("%s:%d transfer paused:%lu\n", __func__, __LINE__, size * nmemb);
+            TRACE("%-35s:%-8d:%-16p transfer paused:%lu\n", __func__, __LINE__, (void*)request, size * nmemb);
             return CURL_READFUNC_PAUSE;
         }
-        request->GetReadDataEventCounter()--;
-        TRACE("%s:%d transfer resumed as already signalled:%lu\n", __func__, __LINE__, size * nmemb);
+        TRACE("%-35s:%-8d:%-16p transfer resumed as already signalled:%lu\n", __func__, __LINE__, (void*)request, size * nmemb);
     }
 
     if (request->GetAsync())
     {
-        DWORD dwInternetStatus;
-        DWORD result;
-        size_t written = 0;
+        std::lock_guard<std::mutex> lck(request->GetReadDataEventMtx());
+        if (!request->GetOutstandingWrites().empty())
 
         {
-            request->GetReadDataEventMtx().lock();
-            BufferRequest buf = request->GetWriteRequest();
-            len = MIN(buf.m_Length, size * nmemb);
+            BufferRequest &buf = PeekBufferRequest(request->GetOutstandingWrites());
+            len = MIN(buf.m_Length - buf.m_Used, size * nmemb);
+
+            if (request->GetTotalLength())
+            {
+                size_t remaining = request->GetTotalLength() - request->GetReadLength();
+                len = MIN(len, remaining);
+            }
+
             request->GetReadLength() += len;
-            request->GetReadDataEventMtx().unlock();
+            TRACE("%-35s:%-8d:%-16p writing additional length:%lu  buf.m_Length:%lu buf.m_Buffer:%p buf.m_Used:%lu\n",
+                  __func__, __LINE__, (void*)request, len, buf.m_Length, buf.m_Buffer, buf.m_Used);
 
-            TRACE("%s:%d writing additional length:%lu written:%lu\n", __func__, __LINE__, len, written);
             if (len)
-                memcpy((char*)ptr, buf.m_Buffer, len);
+            {
+                memcpy(static_cast<char*>(ptr), static_cast<char*>(buf.m_Buffer) + buf.m_Used, len);
+            }
 
-            result = len;
-            dwInternetStatus = WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE;
-            request->AsyncQueue(srequest, dwInternetStatus, sizeof(dwInternetStatus), &result, sizeof(result), true);
+            buf.m_Used += len;
 
-            written += len;
+            if (buf.m_Used == buf.m_Length)
+            {
+                DWORD dwInternetStatus;
+                DWORD result;
+
+                result = buf.m_Length;
+                dwInternetStatus = WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE;
+                request->AsyncQueue(srequest, dwInternetStatus, sizeof(dwInternetStatus), &result, sizeof(result), true);
+                GetBufferRequest(request->GetOutstandingWrites());
+                TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE:%p buf.m_Length:%lu\n", __func__, __LINE__, (void*)request, buf.m_Buffer, buf.m_Length);
+                request->GetReadDataEventCounter()--;
+            }
+
+            TRACE("%-35s:%-8d:%-16p chunk written:%lu\n", __func__, __LINE__, (void*)request, len);
         }
-
-        len = written;
     }
     else
     {
         request->GetReadDataEventMtx().lock();
+        request->GetReadDataEventCounter()--;
         len = MIN(request->GetReadData().size(), size * nmemb);
-        TRACE("%s:%d writing additional length:%lu\n", __func__, __LINE__, len);
-        std::copy(request->GetReadData().begin(), request->GetReadData().begin() + len, (char*)ptr);
+        TRACE("%-35s:%-8d:%-16p writing additional length:%lu\n", __func__, __LINE__, (void*)request, len);
+        std::copy(request->GetReadData().begin(), request->GetReadData().begin() + len, static_cast<char*>(ptr));
         request->GetReadLength() += len;
         request->GetReadData().erase(request->GetReadData().begin(), request->GetReadData().begin() + len);
         request->GetReadData().shrink_to_fit();
@@ -1852,10 +1901,10 @@ int WinHttpRequestImp::SocketCallback(CURL *handle, curl_infotype type,
 
     switch (type) {
     case CURLINFO_TEXT:
-        TRACE_VERBOSE("== Info: %s", data);
+        TRACE_VERBOSE("%-35s:%-8d:%-16p == Info: %s", __func__, __LINE__, (void*)userp, data);
         return 0;
     default: /* in case a new one is introduced to shock us */
-        TRACE_VERBOSE("%s:%d type:%d\n", __func__, __LINE__, type);
+        TRACE_VERBOSE("%-35s:%-8d:%-16p type:%d\n", __func__, __LINE__, (void*)userp, type);
         return 0;
 
     case CURLINFO_HEADER_IN:
@@ -1877,7 +1926,7 @@ int WinHttpRequestImp::SocketCallback(CURL *handle, curl_infotype type,
         text = "<= Recv SSL data";
         break;
     }
-    TRACE_VERBOSE("%s:%d %s\n", __func__, __LINE__, text);
+    TRACE_VERBOSE("%-35s:%-8d:%-16p %s\n", __func__, __LINE__, (void*)userp, text);
 
     return 0;
 }
@@ -1892,16 +1941,23 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpen
 )
 {
     std::shared_ptr<WinHttpSessionImp> session = std::make_shared<WinHttpSessionImp> ();
+    if (!session)
+        return NULL;
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*) (session.get()));
     if (dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY)
     {
         if (!pszProxyW)
             return NULL;
 
+        TRACE("%-35s:%-8d:%-16p proxy: " STRING_LITERAL " \n", __func__, __LINE__, (void*) (session.get()), pszProxyW);
         ConvertCstrAssign(pszProxyW, WCTLEN(pszProxyW), session->GetProxy());
 
         std::vector<std::string> proxies = Split(session->GetProxy(), ';');
+        if (proxies.empty())
+        {
+            proxies.push_back(session->GetProxy());
+        }
         session->SetProxies(proxies);
     }
 
@@ -1922,8 +1978,11 @@ WINHTTPAPI HINTERNET WINAPI WinHttpConnect
 )
 {
     WinHttpSessionImp *session = static_cast<WinHttpSessionImp *>(hSession);
+    if (!session)
+        return NULL;
 
-    TRACE("%s:%d pswzServerName: " STRING_LITERAL " nServerPort:%d\n", __func__, __LINE__, pswzServerName, nServerPort);
+    TRACE("%-35s:%-8d:%-16p pswzServerName: " STRING_LITERAL " nServerPort:%d\n",
+          __func__, __LINE__, (void*)session, pswzServerName, nServerPort);
     ConvertCstrAssign(pswzServerName, WCTLEN(pswzServerName), session->GetServerName());
 
     session->SetServerPort(nServerPort);
@@ -1943,11 +2002,11 @@ BOOLAPI WinHttpCloseHandle(
 {
     WinHttpBase *base = static_cast<WinHttpBase *>(hInternet);
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)base);
     if (!base)
         return FALSE;
 
-    if (WinHttpHandleContainer<WinHttpRequestImp>::Instance().IsRegistered(reinterpret_cast<WinHttpRequestImp *>(hInternet)))
+    if (WinHttpHandleContainer<WinHttpRequestImp>::Instance().IsRegistered(static_cast<WinHttpRequestImp *>(hInternet)))
     {
         WinHttpRequestImp *request = dynamic_cast<WinHttpRequestImp *>(base);
         if (!request)
@@ -1962,7 +2021,7 @@ BOOLAPI WinHttpCloseHandle(
         return TRUE;
     }
 
-    if (WinHttpHandleContainer<WinHttpSessionImp>::Instance().IsRegistered(reinterpret_cast<WinHttpSessionImp *>(hInternet)))
+    if (WinHttpHandleContainer<WinHttpSessionImp>::Instance().IsRegistered(static_cast<WinHttpSessionImp *>(hInternet)))
     {
         WinHttpSessionImp *session = dynamic_cast<WinHttpSessionImp *>(base);
         if (session)
@@ -1973,7 +2032,7 @@ BOOLAPI WinHttpCloseHandle(
         return TRUE;
     }
 
-    if (WinHttpHandleContainer<WinHttpConnectImp>::Instance().IsRegistered(reinterpret_cast<WinHttpConnectImp *>(hInternet)))
+    if (WinHttpHandleContainer<WinHttpConnectImp>::Instance().IsRegistered(static_cast<WinHttpConnectImp *>(hInternet)))
     {
         WinHttpConnectImp *connect = dynamic_cast<WinHttpConnectImp *>(base);
         if (connect)
@@ -1997,21 +2056,27 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
 )
 {
     WinHttpConnectImp *connect = static_cast<WinHttpConnectImp *>(hConnect);
+    if (!connect)
+        return NULL;
+
     WinHttpSessionImp *session = connect->GetHandle();
+    if (!session)
+        return NULL;
+
     CURLcode res;
 
     if (!pwszVerb)
         pwszVerb = TEXT("GET");
 
-    TRACE("%s:%d pwszVerb = " STRING_LITERAL " pwszObjectName: " STRING_LITERAL " pwszVersion = " STRING_LITERAL " pwszReferrer = " STRING_LITERAL "\n",
-        __func__, __LINE__, pwszVerb, pwszObjectName, pwszVersion, pwszReferrer);
+    TRACE("%-35s:%-8d:%-16p pwszVerb = " STRING_LITERAL " pwszObjectName: " STRING_LITERAL " pwszVersion = " STRING_LITERAL " pwszReferrer = " STRING_LITERAL "\n",
+        __func__, __LINE__, (void*)session, pwszVerb, pwszObjectName, pwszVersion, pwszReferrer);
 
     std::shared_ptr<WinHttpRequestImp> srequest(new WinHttpRequestImp, [](WinHttpRequestImp *request) {
 
         std::shared_ptr<WinHttpRequestImp> close_request(request);
-        TRACE("%s::%d reference count reached to 0\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p reference count reached to 0\n", __func__, __LINE__, (void*)request);
 
-        TRACE("%s:%d WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING\n", __func__, __LINE__, (void*)request);
         request->AsyncQueue(close_request, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING, 0, NULL, 0, false);
     });
 
@@ -2044,9 +2109,15 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
     const char *prefix;
     std::string server = session->GetServerName();
     if (dwFlags & WINHTTP_FLAG_SECURE)
+    {
         prefix = "https://";
+        request->GetSecure() = true;
+    }
     else
+    {
         prefix = "http://";
+        request->GetSecure() = false;
+    }
 
     if (server.find("http://") == std::string::npos)
         server = prefix + server;
@@ -2060,7 +2131,7 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
         // convert # to %23 to support links to fragments
         while (true) {
             /* Locate the substring to replace. */
-            index = objectname.find("#", index);
+            index = objectname.find('#', index);
             if (index == std::string::npos) break;
             /* Make the replacement. */
             objectname.replace(index, 1, "%23");
@@ -2074,7 +2145,7 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
     }
     else
     {
-        std::string nullstr("");
+        std::string nullstr;
         request->SetFullPath(server, nullstr);
         if (!request->SetServer(request->GetFullPath(), session->GetServerPort())) {
             return NULL;
@@ -2084,81 +2155,78 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
     if (session->GetTimeout() > 0)
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_TIMEOUT_MS, session->GetTimeout());
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
     }
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_LOW_SPEED_TIME, 60L);
-    if (res != CURLE_OK)
-        return NULL;
+    CURL_BAILOUT_ONERROR(res, request, NULL);
+
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_LOW_SPEED_LIMIT, 1L);
-    if (res != CURLE_OK)
-        return NULL;
+    CURL_BAILOUT_ONERROR(res, request, NULL);
 
     request->SetProxy(session->GetProxies());
-
-    if (WCTCMP(pwszVerb, (const TCHAR *)TEXT("PUT")) == 0)
+    TSTRING verb;
+    verb.assign(pwszVerb);
+    if (verb == TEXT("PUT"))
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_PUT, 1L);
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
 
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_UPLOAD, 1L);
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
+
+        request->Uploading() = true;
     }
-    else if (WCTCMP(pwszVerb, (const TCHAR *)TEXT("GET")) == 0)
+    else if (verb == TEXT("GET"))
     {
     }
-    else if (WCTCMP(pwszVerb, (const TCHAR *)TEXT("POST")) == 0)
+    else if (verb == TEXT("POST"))
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_POST, 1L);
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
     }
     else
     {
-        std::string verb;
+        std::string verbcst;
 
-        ConvertCstrAssign(pwszVerb, WCTLEN(pwszVerb), verb);
-        TRACE("%s:%d setting custom header %s\n", __func__, __LINE__, verb.c_str());
-        res = curl_easy_setopt(request->GetCurl(), CURLOPT_CUSTOMREQUEST, verb.c_str());
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        ConvertCstrAssign(pwszVerb, WCTLEN(pwszVerb), verbcst);
+        TRACE("%-35s:%-8d:%-16p setting custom header %s\n", __func__, __LINE__, (void*)request, verbcst.c_str());
+        res = curl_easy_setopt(request->GetCurl(), CURLOPT_CUSTOMREQUEST, verbcst.c_str());
+        CURL_BAILOUT_ONERROR(res, request, NULL);
+
+        res = curl_easy_setopt(request->GetCurl(), CURLOPT_UPLOAD, 1L);
+        CURL_BAILOUT_ONERROR(res, request, NULL);
+
+        request->Uploading() = true;
     }
 
+#if (LIBCURL_VERSION_MAJOR>=7) && (LIBCURL_VERSION_MINOR >= 50)
     if (pwszVersion)
     {
         int ver;
+        TSTRING version;
+        version.assign(pwszVersion);
 
-        if (WCTCMP(pwszVerb, (const TCHAR*)TEXT("1.0")) == 0)
+        if (version == TEXT("1.0"))
             ver = CURL_HTTP_VERSION_1_0;
-        else if (WCTCMP(pwszVerb, (const TCHAR*)TEXT("1.1")) == 0)
+        else if (version == TEXT("1.1"))
             ver = CURL_HTTP_VERSION_1_1;
-        else if (WCTCMP(pwszVerb, (const TCHAR*)TEXT("2.0")) == 0)
+        else if (version == TEXT("2.0"))
             ver = CURL_HTTP_VERSION_2_0;
         else
             return NULL;
 
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_HTTP_VERSION, ver);
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
     }
+#endif
 
     if (pwszReferrer)
     {
         ConvertCstrAssign(pwszReferrer, WCTLEN(pwszReferrer), session->GetReferrer());
 
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_REFERER, session->GetReferrer().c_str());
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
     }
 
     if (dwFlags & WINHTTP_FLAG_SECURE)
@@ -2171,17 +2239,12 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
         //static const char *pHeaderFile = "dumpit";
         const char *pPassphrase = NULL;
 
-#ifdef USE_ENGINE
-        pKeyName = "rsa_test";
-        pKeyType = "ENG";
-        pEngine = "chil";            /* for nChiper HSM... */
-#else
         pKeyName = NULL;
         pKeyType = "PEM";
         pCertFile = NULL;
         pCACertFile = NULL;
         pEngine = NULL;
-#endif
+
         if (const char* env_p = std::getenv("WINHTTP_PAL_KEYNAME"))
             pKeyName = env_p;
 
@@ -2197,67 +2260,51 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
         if (const char* env_p = std::getenv("WINHTTP_PAL_ENGINE"))
             pEngine = env_p;
 
+        if (const char* env_p = std::getenv("WINHTTP_PAL_KEY_PASSPHRASE"))
+            pPassphrase = env_p;
+
         if (pEngine) {
-            if (curl_easy_setopt(request->GetCurl(), CURLOPT_SSLENGINE, pEngine) != CURLE_OK) {
-                /* load the crypto engine */
-                TRACE("%s", "can't set crypto engine\n");
-                return NULL;
-            }
-            if (curl_easy_setopt(request->GetCurl(), CURLOPT_SSLENGINE_DEFAULT, 1L) != CURLE_OK) {
-                /* set the crypto engine as default */
-                /* only needed for the first time you load
-                   a engine a curl object... */
-                TRACE("%s", "can't set crypto engine as default\n");
-                return NULL;
-            }
+            res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLENGINE, pEngine);
+            CURL_BAILOUT_ONERROR(res, request, NULL);
+
+            res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLENGINE_DEFAULT, 1L);
+            CURL_BAILOUT_ONERROR(res, request, NULL);
         }
         /* cert is stored PEM coded in file... */
         /* since PEM is default, we needn't set it for PEM */
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLCERTTYPE, "PEM");
-        if (res != CURLE_OK) {
-            return NULL;
-        }
+        CURL_BAILOUT_ONERROR(res, request, NULL);
 
         /* set the cert for client authentication */
         if (pCertFile) {
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLCERT, pCertFile);
-            if (res != CURLE_OK) {
-                return NULL;
-            }
+            CURL_BAILOUT_ONERROR(res, request, NULL);
         }
 
         /* sorry, for engine we must set the passphrase
            (if the key has one...) */
         if (pPassphrase) {
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_KEYPASSWD, pPassphrase);
-            if (res != CURLE_OK) {
-                return NULL;
-            }
+            CURL_BAILOUT_ONERROR(res, request, NULL);
         }
 
         /* if we use a key stored in a crypto engine,
            we must set the key type to "ENG" */
         if (pKeyType) {
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLKEYTYPE, pKeyType);
-            if (res != CURLE_OK) {
-                return NULL;
-            }
+            CURL_BAILOUT_ONERROR(res, request, NULL);
         }
 
         /* set the private key (file or ID in engine) */
         if (pKeyName) {
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLKEY, pKeyName);
-            if (res != CURLE_OK) {
-                return NULL;
-            }
+            CURL_BAILOUT_ONERROR(res, request, NULL);
         }
 
         /* set the file with the certs vaildating the server */
         if (pCACertFile) {
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_CAINFO, pCACertFile);
-            if (res != CURLE_OK) {
-                return NULL;
-            }
+            CURL_BAILOUT_ONERROR(res, request, NULL);
         }
     }
     if (pwszVerb)
@@ -2288,31 +2335,23 @@ WinHttpAddRequestHeaders
     if (!srequest)
         return FALSE;
 
-    TRACE("%s:%d lpszHeaders = " STRING_LITERAL " dwModifiers: %lu\n", __func__, __LINE__,
+    TRACE("%-35s:%-8d:%-16p lpszHeaders = " STRING_LITERAL " dwModifiers: %lu\n", __func__, __LINE__, (void*)request,
         lpszHeaders ? lpszHeaders: TEXT(""), dwModifiers);
+
+    if (dwHeadersLength == (DWORD)-1)
+    {
+        dwHeadersLength = lpszHeaders ? WCTLEN(lpszHeaders): 0;
+    }
+
     if (lpszHeaders)
     {
-        size_t nstringLen;
-
-        if (dwHeadersLength == (DWORD)-1)
-        {
-            nstringLen = WCTLEN(lpszHeaders) + 1;
-        }
-        else
-        {
-            nstringLen = dwHeadersLength + 1;
-        }
-
         std::string &headers = request->GetOutgoingHeaderList();
 
-        ConvertCstrAssign(lpszHeaders, nstringLen, headers);
+        ConvertCstrAssign(lpszHeaders, dwHeadersLength, headers);
         request->AddHeader(headers);
 
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_HTTPHEADER, request->GetHeaderList());
-        if (res != CURLE_OK)
-        {
-            return FALSE;
-        }
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
 
     return TRUE;
@@ -2335,6 +2374,9 @@ BOOLAPI WinHttpSendRequest
         return FALSE;
 
     WinHttpConnectImp *connect = request->GetSession();
+    if (!connect)
+        return FALSE;
+
     WinHttpSessionImp *session = connect->GetHandle();
 
     std::shared_ptr<WinHttpRequestImp> srequest = request->shared_from_this();
@@ -2343,16 +2385,21 @@ BOOLAPI WinHttpSendRequest
 
     TSTRING customHeader;
 
-    if (lpszHeaders)
-        customHeader.assign(lpszHeaders, WCTLEN(lpszHeaders));
+    if (dwHeadersLength == (DWORD)-1)
+    {
+        dwHeadersLength = lpszHeaders ? WCTLEN(lpszHeaders): 0;
+    }
 
-    if ((dwTotalLength == 0) && (dwOptionalLength == 0) && (request->GetType() == "PUT"))
+    if (lpszHeaders)
+        customHeader.assign(lpszHeaders, dwHeadersLength);
+
+    if ((dwTotalLength == 0) && (dwOptionalLength == 0) && request->Uploading())
         customHeader += TEXT("Transfer-Encoding: chunked\r\n");
 
-    TRACE("%s:%d lpszHeaders:%p dwHeadersLength:%lu lpOptional:%p dwOptionalLength:%lu dwTotalLength:%lu\n",
-        __func__, __LINE__, lpszHeaders, dwHeadersLength, lpOptional, dwOptionalLength, dwTotalLength);
+    TRACE("%-35s:%-8d:%-16p lpszHeaders:%p dwHeadersLength:%lu lpOptional:%p dwOptionalLength:%lu dwTotalLength:%lu\n",
+        __func__, __LINE__, (void*)request, (const void*)lpszHeaders, dwHeadersLength, lpOptional, dwOptionalLength, dwTotalLength);
 
-    if ((customHeader != TEXT("")) && !WinHttpAddRequestHeaders(hRequest, customHeader.c_str(), customHeader.length(), 0))
+    if (!customHeader.empty() && !WinHttpAddRequestHeaders(hRequest, customHeader.c_str(), customHeader.length(), 0))
         return FALSE;
 
     if (lpOptional)
@@ -2368,12 +2415,11 @@ BOOLAPI WinHttpSendRequest
         {
             /* Now specify the POST data */
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_POSTFIELDS, request->GetOptionalData().c_str());
-            if (res != CURLE_OK)
-                return FALSE;
+            CURL_BAILOUT_ONERROR(res, request, FALSE);
         }
     }
 
-    if ((request->GetType() == "PUT") || (request->GetType() == "POST"))
+    if (request->Uploading() || (request->GetType() == "POST"))
     {
         if (!request->GetAsync() && (dwTotalLength == 0)) {
             SetLastError(ERROR_INVALID_PARAMETER);
@@ -2390,88 +2436,68 @@ BOOLAPI WinHttpSendRequest
     if (request->GetType() == "POST")
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_POSTFIELDSIZE, (long)totalsize);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
     else if (totalsize)
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_INFILESIZE_LARGE, (curl_off_t)totalsize);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
 
     request->GetTotalLength() = dwTotalLength;
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_READDATA, request);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_READFUNCTION, request->ReadCallback);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_DEBUGFUNCTION, request->SocketCallback);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_DEBUGDATA, request);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_WRITEFUNCTION, request->WriteBodyFunction);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_WRITEDATA, request);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_HEADERFUNCTION, request->WriteHeaderFunction);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_HEADERDATA, request);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_PRIVATE, request);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_FOLLOWLOCATION, 1L);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     if (winhttp_tracing_verbose)
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_VERBOSE, 1);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
 
     /* enable TCP keep-alive for this transfer */
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_TCP_KEEPALIVE, 1L);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     /* keep-alive idle time to 120 seconds */
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_TCP_KEEPIDLE, 120L);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     /* interval time between keep-alive probes: 60 seconds */
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_TCP_KEEPINTVL, 60L);
-    if (res != CURLE_OK)
-        return FALSE;
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSL_VERIFYPEER, request->VerifyPeer());
-    if (res != CURLE_OK) {
-        return FALSE;
-    }
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSL_VERIFYHOST, request->VerifyHost());
-    if (res != CURLE_OK) {
-        return FALSE;
-    }
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
 
     DWORD maxConnections = 0;
 
@@ -2482,8 +2508,7 @@ BOOLAPI WinHttpSendRequest
 
     if (maxConnections) {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_MAXCONNECTS, maxConnections);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
 
     if (dwContext)
@@ -2498,37 +2523,28 @@ BOOLAPI WinHttpSendRequest
 
     if (securityProtocols) {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_SSLVERSION, securityProtocols);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
 
     if (request->GetAsync())
     {
         if (request->GetClosing())
         {
-            TRACE("%s:%d \n", __func__, __LINE__);
+            TRACE("%-35s:%-8d:%-16p \n", __func__, __LINE__, (void*)request);
             return FALSE;
         }
         request->CleanUp();
-
-        TRACE("%s:%d use_count = %lu\n", __func__, __LINE__, srequest.use_count());
         request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_SENDING_REQUEST, 0, NULL, 0, false);
-
-        TRACE("%s:%d use_count = %lu\n", __func__, __LINE__, srequest.use_count());
 
         if (!ComContainer::GetInstance().AddHandle(srequest, request->GetCurl()))
             return FALSE;
 
-        TRACE("%s:%d use_count = %lu\n", __func__, __LINE__, srequest.use_count());
         ComContainer::GetInstance().KickStart();
 
-        TRACE("%s:%d use_count = %lu\n", __func__, __LINE__, srequest.use_count());
         request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_REQUEST_SENT, 0, NULL, 0, false);
-
-        TRACE("%s:%d use_count = %lu\n", __func__, __LINE__, srequest.use_count());
         request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, 0, NULL, 0, false);
 
-        TRACE("%s:%d use_count = %lu\n", __func__, __LINE__, srequest.use_count());
+        TRACE("%-35s:%-8d:%-16p use_count = %lu\n", __func__, __LINE__, (void*)request, srequest.use_count());
     }
     else
     {
@@ -2536,7 +2552,7 @@ BOOLAPI WinHttpSendRequest
         {
             DWORD thread_id;
             request->GetUploadThread() = CREATETHREAD(
-                request->UploadThreadFunction,       // thread function name
+                WinHttpRequestImp::UploadThreadFunction,       // thread function name
                 request, &thread_id);          // argument to thread function
         }
         else
@@ -2544,33 +2560,26 @@ BOOLAPI WinHttpSendRequest
             /* Perform the request, res will get the return code */
             res = curl_easy_perform(request->GetCurl());
             /* Check for errors */
-            if (res != CURLE_OK)
-            {
-                TRACE("curl_easy_perform() failed: %s\n",
-                    curl_easy_strerror(res));
-                return FALSE;
-            }
+            CURL_BAILOUT_ONERROR(res, request, FALSE);
         }
     }
 
     return TRUE;
 }
 
-void WinHttpRequestImp::WaitAsyncReceiveCompletion(std::shared_ptr<WinHttpRequestImp> srequest)
+void WinHttpRequestImp::WaitAsyncReceiveCompletion(std::shared_ptr<WinHttpRequestImp> &srequest)
 {
     bool expected = false;
-    bool result = std::atomic_compare_exchange_strong(&GetReceiveResponsePending(), &expected, true);
+    std::atomic_compare_exchange_strong(&GetReceiveResponsePending(), &expected, true);
 
-    TRACE("%s:%d GetReceiveResponsePending() = %d\n", __func__, __LINE__, (int) GetReceiveResponsePending());
-    std::unique_lock<std::mutex> lck(GetReceiveCompletionEventMtx());
-    while (!GetReceiveCompletionEventCounter())
-        GetReceiveCompletionEvent().wait(lck);
-    lck.unlock();
-
-    if (result && (GetCompletionCode() == CURLE_OK))
+    TRACE("%-35s:%-8d:%-16p GetReceiveResponsePending() = %d\n", __func__, __LINE__, (void*)this, (int) GetReceiveResponsePending());
     {
-        TRACE("%s:%d HandleReceiveNotifications \n", __func__, __LINE__);
-        HandleReceiveNotifications(srequest);
+        std::lock_guard<std::mutex> lck(GetReceiveCompletionEventMtx());
+        if (ResponseCallbackEventCounter())
+        {
+            TRACE("%-35s:%-8d:%-16p HandleReceiveNotifications \n", __func__, __LINE__, (void*)this);
+            HandleReceiveNotifications(srequest);
+        }
     }
 }
 
@@ -2591,16 +2600,16 @@ WinHttpReceiveResponse
     if (!srequest)
         return FALSE;
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
 
-    if ((request->GetTotalLength() == 0) && (request->GetOptionalData().length() == 0) && (request->GetType() == "PUT"))
+    if ((request->GetTotalLength() == 0) && (request->GetOptionalData().length() == 0) && request->Uploading())
     {
         if (request->GetAsync())
         {
             {
                 std::lock_guard<std::mutex> lck(request->GetReadDataEventMtx());
                 request->GetReadDataEventCounter()++;
-                TRACE("%s:%d\n", __func__, __LINE__);
+                TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
             }
 
             ComContainer::GetInstance().ResumeTransfer(request->GetCurl(), CURLPAUSE_CONT);
@@ -2609,12 +2618,12 @@ WinHttpReceiveResponse
 
     if (request->GetAsync())
     {
-        TRACE("%s:%d\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
         request->WaitAsyncReceiveCompletion(srequest);
     }
     else
     {
-        if (request->GetType() == "PUT")
+        if (request->Uploading())
         {
             while (request->GetTotalLength() != request->GetReadLength()) {
                 if (request->GetUploadThreadExitStatus()) {
@@ -2640,7 +2649,7 @@ WinHttpReceiveResponse
     return TRUE;
 }
 
-bool WinHttpRequestImp::HandleQueryDataNotifications(std::shared_ptr<WinHttpRequestImp> srequest, size_t available)
+bool WinHttpRequestImp::HandleQueryDataNotifications(std::shared_ptr<WinHttpRequestImp> &srequest, size_t available)
 {
     bool expected = true;
     bool result = std::atomic_compare_exchange_strong(&GetQueryDataPending(), &expected, false);
@@ -2657,25 +2666,25 @@ bool WinHttpRequestImp::HandleQueryDataNotifications(std::shared_ptr<WinHttpRequ
         }
 
         DWORD lpvStatusInformation = static_cast<DWORD>(available);
-        TRACE("%s:%d WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:%lu\n", __func__, __LINE__, lpvStatusInformation);
+        TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:%lu\n", __func__, __LINE__, (void*)this, lpvStatusInformation);
         AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE, sizeof(lpvStatusInformation),
             (LPVOID)&lpvStatusInformation, sizeof(lpvStatusInformation), true);
     }
     return result;
 }
 
-void WinHttpRequestImp::WaitAsyncQueryDataCompletion(std::shared_ptr<WinHttpRequestImp> srequest)
+void WinHttpRequestImp::WaitAsyncQueryDataCompletion(std::shared_ptr<WinHttpRequestImp> &srequest)
 {
     bool completed;
     GetQueryDataPending() = true;
-    TRACE("%s:%d GetQueryDataPending() = %d\n", __func__, __LINE__, (int)GetQueryDataPending());
+    TRACE("%-35s:%-8d:%-16p GetQueryDataPending() = %d\n", __func__, __LINE__, (void*)this, (int)GetQueryDataPending());
     {
         std::lock_guard<std::mutex> lck(GetQueryDataEventMtx());
         completed = GetQueryDataEventState();
     }
 
     if (completed) {
-        TRACE("%s:%d transfer already finished\n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p transfer already finished\n", __func__, __LINE__, (void*)this);
         HandleQueryDataNotifications(srequest, 0);
     }
 }
@@ -2697,7 +2706,7 @@ WinHttpQueryDataAvailable
 
     if (request->GetClosing())
     {
-        TRACE("%s:%d \n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p \n", __func__, __LINE__, (void*)request);
         return FALSE;
     }
 
@@ -2712,19 +2721,18 @@ WinHttpQueryDataAvailable
     {
         if (available == 0)
         {
-            TRACE("%s:%d !!!!!!!\n", __func__, __LINE__);
+            TRACE("%-35s:%-8d:%-16p !!!!!!!\n", __func__, __LINE__, (void*)request);
             request->WaitAsyncQueryDataCompletion(srequest);
             request->GetBodyStringMutex().lock();
             length = request->GetResponseString().size();
             available = length;
-            TRACE("%s:%d available = %lu\n", __func__, __LINE__, available);
+            TRACE("%-35s:%-8d:%-16p available = %lu\n", __func__, __LINE__, (void*)request, available);
             request->GetBodyStringMutex().unlock();
         }
         else
         {
-            TRACE("%s:%d available = %lu\n", __func__, __LINE__, available);
             DWORD lpvStatusInformation = available;
-            TRACE("%s:%d WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:%lu\n", __func__, __LINE__, lpvStatusInformation);
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:%lu\n", __func__, __LINE__, (void*)request, lpvStatusInformation);
             request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE, sizeof(lpvStatusInformation),
                 (LPVOID)&lpvStatusInformation, sizeof(lpvStatusInformation), true);
 
@@ -2737,47 +2745,6 @@ WinHttpQueryDataAvailable
         *lpdwNumberOfBytesAvailable = available;
 
     return TRUE;
-}
-
-size_t WinHttpRequestImp::WaitDataAvailable()
-{
-    size_t length, remainingLength, readLength;
-
-    GetBodyStringMutex().lock();
-    length = GetResponseString().size();
-    readLength = remainingLength = length;
-    if (GetAsync() == TRUE)
-    {
-/* check the size */
-        while (((length == 0) || (remainingLength == 0)) &&
-            (!GetCompletionStatus()))
-        {
-            GetBodyStringMutex().unlock();
-
-            TRACE("%s:%d\n", __func__, __LINE__);
-            ComContainer::GetInstance().KickStart();
-
-            TRACE("%s:%d\n", __func__, __LINE__);
-            {
-                std::unique_lock<std::mutex> lck(GetDataAvailableMtx());
-                while (!GetDataAvailableEventCounter() && !GetCompletionStatus())
-                    GetDataAvailableEvent().wait(lck);
-                lck.unlock();
-
-                TRACE("%s:%d\n", __func__, __LINE__);
-                GetDataAvailableEventCounter()--;
-            }
-
-            GetBodyStringMutex().lock();
-
-            length = GetResponseString().size();
-            readLength = remainingLength = length;
-            TRACE("%s:%d length:%lu readLength:%lu completion: %d\n", __func__, __LINE__,
-                length, readLength, GetCompletionStatus());
-        }
-    }
-    GetBodyStringMutex().unlock();
-    return readLength;
 }
 
 BOOLAPI
@@ -2799,13 +2766,13 @@ WinHttpReadData
 
     if (request->GetClosing())
     {
-        TRACE("%s:%d \n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p \n", __func__, __LINE__, (void*)request);
         return FALSE;
     }
 
     size_t readLength;
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
     if (dwNumberOfBytesToRead == 0)
     {
         if (lpdwNumberOfBytesRead)
@@ -2815,41 +2782,45 @@ WinHttpReadData
         {
             LPVOID StatusInformation = (LPVOID)lpBuffer;
 
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_READ_COMPLETE lpBuffer: %p length:%d\n", __func__, __LINE__, (void*)request, lpBuffer, 0);
             request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, 0, (LPVOID)StatusInformation, sizeof(StatusInformation), false);
         }
         return TRUE;
     }
 
-    readLength = request->WaitDataAvailable();
-
     request->GetBodyStringMutex().lock();
-    if (readLength > dwNumberOfBytesToRead)
-    {
-        readLength = dwNumberOfBytesToRead;
-    }
+    readLength = request->GetResponseString().size();
     if (readLength)
     {
-        std::copy(request->GetResponseString().begin(), request->GetResponseString().begin() + readLength, reinterpret_cast<char *>(lpBuffer));
+        if (readLength > dwNumberOfBytesToRead)
+        {
+            readLength = dwNumberOfBytesToRead;
+        }
+        std::copy(request->GetResponseString().begin(), request->GetResponseString().begin() + readLength, static_cast<char *>(lpBuffer));
         request->GetResponseString().erase(request->GetResponseString().begin(), request->GetResponseString().begin() + readLength);
         request->GetResponseString().shrink_to_fit();
     }
-    request->GetBodyStringMutex().unlock();
 
-    if (readLength == 0)
-    {
-        TRACE("%s", "!!!!!!!!!!done!!!!!!!!!!!!!!!\n");
-    }
-    TRACE("%s:%d lpBuffer: %p length:%lu\n", __func__, __LINE__, lpBuffer, readLength);
     if (request->GetAsync())
     {
-        LPVOID StatusInformation = (LPVOID)lpBuffer;
+        if ((readLength == 0) && (!request->GetCompletionStatus()))
+        {
+            TRACE("%-35s:%-8d:%-16p Queueing pending reads %p %ld\n", __func__, __LINE__, (void*)request, lpBuffer, dwNumberOfBytesToRead);
+            QueueBufferRequest(request->GetOutstandingReads(), lpBuffer, dwNumberOfBytesToRead);
+        }
+        else
+        {
+            LPVOID StatusInformation = (LPVOID)lpBuffer;
 
-        request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, readLength, (LPVOID)StatusInformation, sizeof(StatusInformation), false);
+            TRACE("%-35s:%-8d:%-16p WINHTTP_CALLBACK_STATUS_READ_COMPLETE lpBuffer: %p length:%lu\n", __func__, __LINE__, (void*)request, lpBuffer, readLength);
+            request->AsyncQueue(srequest, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, readLength, (LPVOID)StatusInformation, sizeof(StatusInformation), false);
+        }
     }
+    request->GetBodyStringMutex().unlock();
 
     if (lpdwNumberOfBytesRead)
         *lpdwNumberOfBytesRead = (DWORD)readLength;
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)request);
     return TRUE;
 }
 
@@ -2868,7 +2839,8 @@ WinHttpSetTimeouts
     WinHttpRequestImp *request;
     CURLcode res;
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p nResolveTimeout:%d nConnectTimeout:%d nSendTimeout:%d nReceiveTimeout:%d\n",
+          __func__, __LINE__, (void*)base, nResolveTimeout, nConnectTimeout, nSendTimeout, nReceiveTimeout);
     if ((session = dynamic_cast<WinHttpSessionImp *>(base)))
     {
         session->SetTimeout(nReceiveTimeout);
@@ -2876,27 +2848,12 @@ WinHttpSetTimeouts
     else if ((request = dynamic_cast<WinHttpRequestImp *>(base)))
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_TIMEOUT_MS, nReceiveTimeout);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
     else
         return FALSE;
 
     return TRUE;
-}
-
-static int NumDigits(DWORD value)
-{
-    int count = 0;
-
-    while (value != 0)
-    {
-        // n = n/10
-        value /= 10;
-        ++count;
-    }
-
-    return count;
 }
 
 static TSTRING FindRegex(const TSTRING &subject,const TSTRING &regstr)
@@ -2909,13 +2866,77 @@ static TSTRING FindRegex(const TSTRING &subject,const TSTRING &regstr)
 
             result = match.str(0);
         } else {
-            result = TSTRING(TEXT(""));
+            result = TEXT("");
             return TEXT("");
         }
     } catch (std::regex_error&) {
         return TEXT("");
     }
     return result;
+}
+
+bool is_newline(char i)
+{
+    return (i == '\n') || (i == '\r');
+}
+
+template<class CharT>
+std::basic_string<CharT> nullize_newlines(const std::basic_string<CharT>& str) {
+    std::basic_string<CharT> result;
+    result.reserve(str.size());
+
+    auto cursor = str.begin();
+    const auto end = str.end();
+    for (;;) {
+        cursor = std::find_if_not(cursor, end, is_newline);
+        if (cursor == end) {
+            return result;
+        }
+
+        const auto nextNewline = std::find_if(cursor, end, is_newline);
+        result.append(cursor, nextNewline);
+        result.push_back(CharT{});
+        cursor = nextNewline;
+    }
+}
+
+static BOOL ReadCurlValue(WinHttpRequestImp *request, LPVOID lpBuffer, LPDWORD lpdwBufferLength,
+                          CURLINFO curlparam, bool returnDWORD)
+{
+    CURLcode res;
+    DWORD retValue;
+
+    res = curl_easy_getinfo(request->GetCurl(), curlparam, &retValue);
+    CURL_BAILOUT_ONERROR(res, request, FALSE);
+
+    if (!returnDWORD)
+    {
+        TSTRING str = TO_STRING(retValue);
+        if (SizeCheck(lpBuffer, lpdwBufferLength, (str.size() + 1) * sizeof(TCHAR)) == FALSE)
+            return FALSE;
+    }
+    else
+    {
+        if (SizeCheck(lpBuffer, lpdwBufferLength, sizeof(DWORD)) == FALSE)
+            return FALSE;
+    }
+
+    if (returnDWORD)
+    {
+        memcpy(lpBuffer, &retValue, sizeof(retValue));
+    }
+    else
+    {
+        TCHAR *outbuf = static_cast<TCHAR*>(lpBuffer);
+        TSTRING str = TO_STRING(retValue);
+        std::copy(str.begin(), str.end(), outbuf);
+        outbuf[str.size()] = TEXT('\0');
+
+        if (lpdwBufferLength)
+            *lpdwBufferLength = (str.size() + 1) * sizeof(TCHAR);
+    }
+    TRACE("%-35s:%-8d:%-16p curlparam:%d code :%lu\n", __func__, __LINE__, (void*)request, curlparam, retValue);
+    return TRUE;
 }
 
 BOOLAPI WinHttpQueryHeaders(
@@ -2951,94 +2972,43 @@ BOOLAPI WinHttpQueryHeaders(
         dwInfoLevel &= ~WINHTTP_QUERY_FLAG_NUMBER;
         returnDWORD = true;
     }
-    TRACE("%s:%d dwInfoLevel = 0x%lx\n", __func__, __LINE__, dwInfoLevel);
+    TRACE("%-35s:%-8d:%-16p dwInfoLevel = 0x%lx\n", __func__, __LINE__, (void*)request, dwInfoLevel);
 
     if (returnDWORD && SizeCheck(lpBuffer, lpdwBufferLength, sizeof(DWORD)) == FALSE)
         return FALSE;
 
+#if (LIBCURL_VERSION_MAJOR>=7) && (LIBCURL_VERSION_MINOR >= 50)
     if (dwInfoLevel == WINHTTP_QUERY_VERSION)
     {
-        CURLcode res;
-        DWORD retValue;
-
-        res = curl_easy_getinfo(request->GetCurl(), CURLINFO_HTTP_VERSION, &retValue);
-        if (res != CURLE_OK)
-            return FALSE;
-
-        if (!returnDWORD && SizeCheck(lpBuffer, lpdwBufferLength, (NumDigits(retValue) + 1) * sizeof(TCHAR)) == FALSE)
-            return FALSE;
-
-        if (!lpBuffer)
-            return FALSE;
-
-        if (returnDWORD)
-        {
-            memcpy(lpBuffer, &retValue, sizeof(retValue));
-        }
-        else
-        {
-            TCHAR *outbuf = reinterpret_cast<TCHAR*>(lpBuffer);
-            STNPRINTF(outbuf, *lpdwBufferLength, TEXT("%ld"), retValue);
-            outbuf[*lpdwBufferLength/sizeof(outbuf[0]) - 1] = TEXT('\0');
-        }
-        return TRUE;
+        return ReadCurlValue(request, lpBuffer, lpdwBufferLength, CURLINFO_HTTP_VERSION, returnDWORD);
     }
-
+#endif
     if (dwInfoLevel == WINHTTP_QUERY_STATUS_CODE)
     {
-        CURLcode res;
-        DWORD retValue;
+        WinHttpSessionImp *session;
 
-        res = curl_easy_getinfo(request->GetCurl(), CURLINFO_RESPONSE_CODE, &retValue);
-        if (res != CURLE_OK)
-            return FALSE;
-
-        if (!returnDWORD && SizeCheck(lpBuffer, lpdwBufferLength, (NumDigits(retValue) + 1) * sizeof(TCHAR)) == FALSE)
-            return FALSE;
-
-        if (!lpBuffer)
-            return FALSE;
-
-        if (returnDWORD)
-        {
-            memcpy(lpBuffer, &retValue, sizeof(retValue));
-        }
+        session = GetImp(request);
+        if (!session->GetProxies().empty() && request->GetSecure())
+            return ReadCurlValue(request, lpBuffer, lpdwBufferLength, CURLINFO_HTTP_CONNECTCODE, returnDWORD);
         else
-        {
-            TCHAR *outbuf = reinterpret_cast<TCHAR*>(lpBuffer);
-            STNPRINTF(outbuf, *lpdwBufferLength, TEXT("%ld"), retValue);
-            outbuf[*lpdwBufferLength/sizeof(outbuf[0]) - 1] = TEXT('\0');
-        }
-        TRACE("%s:%d status code :%lu\n", __func__, __LINE__, retValue);
-        return TRUE;
+            return ReadCurlValue(request, lpBuffer, lpdwBufferLength, CURLINFO_RESPONSE_CODE, returnDWORD);
     }
 
     if (dwInfoLevel == WINHTTP_QUERY_STATUS_TEXT)
     {
         CURLcode res;
         DWORD responseCode;
-        size_t length;
 
         res = curl_easy_getinfo(request->GetCurl(), CURLINFO_RESPONSE_CODE, &responseCode);
-        if (res != CURLE_OK)
-            return FALSE;
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
 
         std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
-        length = request->GetHeaderString().length();
-
-        if (SizeCheck(lpBuffer, lpdwBufferLength, (length + 1) * sizeof(TCHAR)) == FALSE)
-            return FALSE;
-
-        if (!lpBuffer)
-            return FALSE;
 
 #ifdef UNICODE
         TSTRING subject;
 
         std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
         subject = conv.from_bytes(request->GetHeaderString());
-        subject[request->GetHeaderString().length()] = TEXT('\0');
-
 #else
         TSTRING &subject = request->GetHeaderString();
 #endif
@@ -3049,7 +3019,7 @@ BOOLAPI WinHttpQueryHeaders(
         regstr.append(TO_STRING(responseCode));
 
         TSTRING result = FindRegex(subject, regstr);
-        if (result != TEXT(""))
+        if (!result.empty())
         {
             size_t offset = subject.find(result);
             if (offset == std::string::npos)
@@ -3059,25 +3029,30 @@ BOOLAPI WinHttpQueryHeaders(
             if (offsetendofline == std::string::npos)
                 return FALSE;
 
-            size_t linelength = offsetendofline - offset;
-            if (linelength == std::string::npos)
+            size_t startpos = offset + result.length() + 1;
+            if (offsetendofline <= startpos)
                 return FALSE;
 
-            WCTNCPY((TCHAR*)lpBuffer,
-                    subject.c_str() + offset + result.length() + 1,
-                    linelength - result.length() - 1);
+            size_t linelength = offsetendofline - startpos;
+            if (SizeCheck(lpBuffer, lpdwBufferLength, (linelength + 1) * sizeof(TCHAR)) == FALSE)
+                return FALSE;
 
-            ((TCHAR*)lpBuffer)[linelength - result.length() - 1] = TEXT('\0');
+            std::copy(subject.begin() + startpos, subject.begin() + offsetendofline,
+                      (TCHAR*)lpBuffer);
+            ((TCHAR*)lpBuffer)[linelength] = TEXT('\0');
             return TRUE;
         }
         else
         {
-            TSTRING retStr = StatusCodeMap[responseCode];
-            if (retStr == TEXT(""))
+            TSTRING retStr = StatusCodeMap.at(responseCode);
+            if (retStr.empty())
                 return FALSE;
 
-            const TCHAR *cstr = retStr.c_str();
-            WCTCPY((TCHAR*)lpBuffer, cstr);
+            if (SizeCheck(lpBuffer, lpdwBufferLength, (retStr.size() + 1) * sizeof(TCHAR)) == FALSE)
+                return FALSE;
+
+            std::copy(retStr.begin(), retStr.end(), (TCHAR*)lpBuffer);
+            ((TCHAR*)lpBuffer)[retStr.size()] = TEXT('\0');
         }
         return TRUE;
     }
@@ -3085,57 +3060,32 @@ BOOLAPI WinHttpQueryHeaders(
 
     if (dwInfoLevel == WINHTTP_QUERY_RAW_HEADERS)
     {
-        size_t length;
         std::string header;
-        TCHAR *wbuffer = reinterpret_cast<TCHAR*>(lpBuffer);
+        TCHAR *wbuffer = static_cast<TCHAR*>(lpBuffer);
 
-        request->GetHeaderStringMutex().lock();
-        length = request->GetHeaderString().length();
+        std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
         header.append(request->GetHeaderString());
-        request->GetHeaderStringMutex().unlock();
 
-        if (SizeCheck(lpBuffer, lpdwBufferLength, (length + 1) * sizeof(TCHAR)) == FALSE)
-            return FALSE;
-
-        if (!wbuffer)
-            return FALSE;
-
-        ReplaceStr(header, "\r\n", "\n");
-        ReplaceStr(header, "\n\r", "\n");
-        ReplaceStr(header, "\r", "\n");
-        ReplaceStr(header, "\n\n", "\n");
-        std::replace(header.begin(), header.end(), '\n', '\0');
+        header = nullize_newlines(header);
         header.resize(header.size() + 1);
-        length = header.size();
+
+        if (SizeCheck(lpBuffer, lpdwBufferLength, (header.length() + 1) * sizeof(TCHAR)) == FALSE)
+            return FALSE;
 
 #ifdef UNICODE
         std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
         std::wstring wc = conv.from_bytes(header);
+
+        if (lpdwBufferLength && (*lpdwBufferLength < ((wc.length() + 1) * sizeof(TCHAR))))
+            return FALSE;
+
         std::copy(wc.begin(), wc.end(), wbuffer);
-        wbuffer[header.length()] = TEXT('\0');
 #else
-        strncpy(wbuffer, header.c_str(), length);
+        std::copy(header.begin(), header.end(), wbuffer);
 #endif
-        if (wbuffer[length] != TEXT('\0'))
-        {
-            if (lpdwBufferLength)
-            {
-                if ((length + 1) < (*lpdwBufferLength / sizeof(TCHAR)))
-                {
-                    wbuffer[length] = 0;
-                }
-                else
-                {
-                    wbuffer[(*lpdwBufferLength / sizeof(TCHAR)) - 1] = 0;
-                }
-            }
-            else
-            {
-                wbuffer[length] = 0;
-            }
-        }
+        wbuffer[header.length()] = TEXT('\0');
         if (lpdwBufferLength)
-            *lpdwBufferLength = (DWORD)length;
+            *lpdwBufferLength = (DWORD)header.length();
         return TRUE;
     }
 
@@ -3143,40 +3093,24 @@ BOOLAPI WinHttpQueryHeaders(
     {
         std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
         size_t length;
-        TCHAR *wbuffer = reinterpret_cast<TCHAR*>(lpBuffer);
+        TCHAR *wbuffer = static_cast<TCHAR*>(lpBuffer);
 
         length = request->GetHeaderString().length();
 
         if (SizeCheck(lpBuffer, lpdwBufferLength, (length + 1) * sizeof(TCHAR)) == FALSE)
             return FALSE;
 
-        if (!wbuffer)
-            return FALSE;
-
 #ifdef UNICODE
         std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
         std::wstring wc = conv.from_bytes(request->GetHeaderString());
-        std::copy(wc.begin(), wc.end(), wbuffer);
-        wbuffer[request->GetHeaderString().length()] = TEXT('\0');
+        if (lpdwBufferLength && (*lpdwBufferLength < ((wc.length() + 1) * sizeof(TCHAR))))
+            return FALSE;
 
+        std::copy(wc.begin(), wc.end(), wbuffer);
 #else
-        strncpy(wbuffer, request->GetHeaderString().c_str(), length);
+        std::copy(request->GetHeaderString().begin(), request->GetHeaderString().end(), wbuffer);
 #endif
-        if (lpdwBufferLength)
-        {
-            if ((length + 1) < (*lpdwBufferLength / sizeof(TCHAR)))
-            {
-                wbuffer[length] = 0;
-            }
-            else
-            {
-                wbuffer[(*lpdwBufferLength / sizeof(TCHAR)) - 1] = 0;
-            }
-        }
-        else
-        {
-            wbuffer[length] = 0;
-        }
+        wbuffer[length] = TEXT('\0');
         if (lpdwBufferLength)
             *lpdwBufferLength = (DWORD)(length * sizeof(TCHAR));
         return TRUE;
@@ -3186,33 +3120,69 @@ BOOLAPI WinHttpQueryHeaders(
     return FALSE;
 }
 
-DWORD ConvertSecurityProtocol(DWORD offered)
+static DWORD ConvertSecurityProtocol(DWORD offered)
 {
-    DWORD curlOffered = CURL_SSLVERSION_DEFAULT;
+    DWORD min = 0;
+    DWORD max = 0;
 
-    if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_SSL2)
-        curlOffered = CURL_SSLVERSION_SSLv2;
-
-    if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_SSL3)
-        curlOffered = CURL_SSLVERSION_SSLv3;
+    if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_SSL2) {
+        min = CURL_SSLVERSION_SSLv2;
+    }
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_SSL3) {
+        min = CURL_SSLVERSION_SSLv3;
+    }
+    else
+        min = CURL_SSLVERSION_DEFAULT;
 
     if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1) {
-        curlOffered = CURL_SSLVERSION_TLSv1;
-        curlOffered |= CURL_SSLVERSION_MAX_TLSv1_0;
+        min = CURL_SSLVERSION_TLSv1_0;
+
+    }
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1) {
+        min = CURL_SSLVERSION_TLSv1_1;
+    }
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2) {
+        min = CURL_SSLVERSION_TLSv1_2;
     }
 
-    if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1) {
-        curlOffered = CURL_SSLVERSION_TLSv1;
-        curlOffered &= ~0xFFFF;
-        curlOffered |= CURL_SSLVERSION_MAX_TLSv1_1;
-    }
-
+#if (LIBCURL_VERSION_MAJOR>=7) && (LIBCURL_VERSION_MINOR >= 61)
     if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2) {
-        curlOffered = CURL_SSLVERSION_TLSv1;
-        curlOffered &= ~0xFFFF;
-        curlOffered |= CURL_SSLVERSION_MAX_TLSv1_2;
+        max = CURL_SSLVERSION_MAX_TLSv1_2;
     }
-    return curlOffered;
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1) {
+        max = CURL_SSLVERSION_MAX_TLSv1_1;
+    }
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1) {
+        max = CURL_SSLVERSION_MAX_TLSv1_0;
+    }
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_SSL3) {
+        max = CURL_SSLVERSION_SSLv3;
+    }
+    else if (offered & WINHTTP_FLAG_SECURE_PROTOCOL_SSL2) {
+        max = CURL_SSLVERSION_SSLv2;
+    }
+    else
+        max = CURL_SSLVERSION_MAX_DEFAULT;
+#endif
+
+    return min | max;
+}
+
+
+template <class T, typename prmtype>
+static BOOL CallMemberFunction(WinHttpBase *base, std::function<BOOL(T*, prmtype *data)> fn, LPVOID    lpBuffer)
+{
+    T *obj;
+
+    if (!lpBuffer)
+        return FALSE;
+
+    if ((obj = dynamic_cast<T *>(base)))
+    {
+        if (fn(obj, static_cast<prmtype*>(lpBuffer)))
+            return TRUE;
+    }
+    return FALSE;
 }
 
 BOOLAPI WinHttpSetOption(
@@ -3224,107 +3194,50 @@ BOOLAPI WinHttpSetOption(
 {
     WinHttpBase *base = static_cast<WinHttpBase *>(hInternet);
 
-    TRACE("%s:%d dwOption:%lu\n", __func__, __LINE__, dwOption);
+    TRACE("%-35s:%-8d:%-16p dwOption:%lu\n", __func__, __LINE__, (void*)base, dwOption);
 
     if (dwOption == WINHTTP_OPTION_MAX_CONNS_PER_SERVER)
     {
-        WinHttpSessionImp *session;
-        WinHttpRequestImp *request;
-
         if (dwBufferLength != sizeof(DWORD))
             return FALSE;
 
-        if ((session = dynamic_cast<WinHttpSessionImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
-
-            if (!session->SetMaxConnections(reinterpret_cast<DWORD*>(lpBuffer)))
-                return FALSE;
+        if (CallMemberFunction<WinHttpSessionImp, DWORD>(base, &WinHttpSessionImp::SetMaxConnections, lpBuffer))
             return TRUE;
-        }
-        else if ((request = dynamic_cast<WinHttpRequestImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
 
-            if (!request->SetMaxConnections(reinterpret_cast<DWORD*>(lpBuffer)))
-                return FALSE;
+        if (CallMemberFunction<WinHttpRequestImp, DWORD>(base, &WinHttpRequestImp::SetMaxConnections, lpBuffer))
             return TRUE;
-        }
-        else
-            return FALSE;
 
+        return FALSE;
     }
     else if (dwOption == WINHTTP_OPTION_CONTEXT_VALUE)
     {
-        WinHttpConnectImp *connect;
-        WinHttpSessionImp *session;
-        WinHttpRequestImp *request;
-
         if (dwBufferLength != sizeof(void*))
             return FALSE;
 
-        if ((connect = dynamic_cast<WinHttpConnectImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
-
-            if (!connect->SetUserData(reinterpret_cast<void**>(lpBuffer)))
-                return FALSE;
+        if (CallMemberFunction<WinHttpConnectImp, void*>(base, &WinHttpConnectImp::SetUserData, lpBuffer))
             return TRUE;
-        }
-        else if ((session = dynamic_cast<WinHttpSessionImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
 
-            if (!session->SetUserData(reinterpret_cast<void**>(lpBuffer)))
-                return FALSE;
+        if (CallMemberFunction<WinHttpSessionImp, void*>(base, &WinHttpSessionImp::SetUserData, lpBuffer))
             return TRUE;
-        }
-        else if ((request = dynamic_cast<WinHttpRequestImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
 
-            if (!request->SetUserData(reinterpret_cast<void**>(lpBuffer)))
-                return FALSE;
+        if (CallMemberFunction<WinHttpRequestImp, void*>(base, &WinHttpRequestImp::SetUserData, lpBuffer))
             return TRUE;
-        }
-        else
-            return FALSE;
+
+        return FALSE;
     }
     else if (dwOption == WINHTTP_OPTION_SECURE_PROTOCOLS)
     {
-        WinHttpSessionImp *session;
-        WinHttpRequestImp *request;
-
         if (dwBufferLength != sizeof(DWORD))
             return FALSE;
 
-        if ((session = dynamic_cast<WinHttpSessionImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
-
-            DWORD curlOffered = ConvertSecurityProtocol(*reinterpret_cast<DWORD*>(lpBuffer));
-            if (curlOffered  && !session->SetSecureProtocol(&curlOffered))
-                return FALSE;
+        DWORD curlOffered = ConvertSecurityProtocol(*static_cast<DWORD*>(lpBuffer));
+        if (CallMemberFunction<WinHttpSessionImp, DWORD>(base, &WinHttpSessionImp::SetSecureProtocol, &curlOffered))
             return TRUE;
-        }
-        else if ((request = dynamic_cast<WinHttpRequestImp *>(base)))
-        {
-            if (!lpBuffer)
-                return FALSE;
 
-            DWORD curlOffered = ConvertSecurityProtocol(*reinterpret_cast<DWORD*>(lpBuffer));
-            if (curlOffered && !request->SetSecureProtocol(&curlOffered))
-                return FALSE;
+        if (CallMemberFunction<WinHttpRequestImp, DWORD>(base, &WinHttpRequestImp::SetSecureProtocol, &curlOffered))
             return TRUE;
-        }
-        else
-            return FALSE;
+
+        return FALSE;
     }
     else if (dwOption == WINHTTP_OPTION_SECURITY_FLAGS)
     {
@@ -3338,7 +3251,7 @@ BOOLAPI WinHttpSetOption(
             if (!lpBuffer)
                 return FALSE;
 
-            DWORD value = *reinterpret_cast<DWORD*>(lpBuffer);
+            DWORD value = *static_cast<DWORD*>(lpBuffer);
             if (value == (SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
                 SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE))
             {
@@ -3377,7 +3290,7 @@ WinHttpSetStatusCallback
     WINHTTP_STATUS_CALLBACK oldcb;
     DWORD olddwNotificationFlags;
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)session);
 
     if (hInternet == NULL)
         return WINHTTP_INVALID_STATUS_CALLBACK;
@@ -3399,28 +3312,25 @@ WinHttpQueryOption
     WinHttpBase *base = static_cast<WinHttpBase *>(hInternet);
     WinHttpSessionImp *session;
 
-    TRACE("%s:%d\n", __func__, __LINE__);
+    TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)base);
+
+    if (!base)
+        return FALSE;
 
     if (WINHTTP_OPTION_CONNECT_TIMEOUT == dwOption)
     {
         if (SizeCheck(lpBuffer, lpdwBufferLength, sizeof(DWORD)) == FALSE)
             return FALSE;
 
-        if (!lpBuffer)
-            return FALSE;
-
         session = GetImp(base);
         if (!session)
             return FALSE;
 
-        *reinterpret_cast<DWORD *>(lpBuffer) = session->GetTimeout();
+        *static_cast<DWORD *>(lpBuffer) = session->GetTimeout();
     }
     if (WINHTTP_OPTION_CALLBACK == dwOption)
     {
         if (SizeCheck(lpBuffer, lpdwBufferLength, sizeof(LPVOID)) == FALSE)
-            return FALSE;
-
-        if (!lpBuffer)
             return FALSE;
 
         session = GetImp(base);
@@ -3429,7 +3339,7 @@ WinHttpQueryOption
 
         DWORD dwNotificationFlags;
         WINHTTP_STATUS_CALLBACK cb = session->GetCallback(&dwNotificationFlags);
-        *reinterpret_cast<WINHTTP_STATUS_CALLBACK *>(lpBuffer) = cb;
+        *static_cast<WINHTTP_STATUS_CALLBACK *>(lpBuffer) = cb;
     }
     else if (WINHTTP_OPTION_URL == dwOption)
     {
@@ -3446,34 +3356,21 @@ WinHttpQueryOption
         if (SizeCheck(lpBuffer, lpdwBufferLength, (strlen(url) + 1) * sizeof(TCHAR)) == FALSE)
             return FALSE;
 
-        TCHAR *wbuffer = reinterpret_cast<TCHAR*>(lpBuffer);
+        TCHAR *wbuffer = static_cast<TCHAR*>(lpBuffer);
         size_t length = strlen(url);
 #ifdef UNICODE
         std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
         std::wstring wc = conv.from_bytes(std::string(url));
+        if (lpdwBufferLength && (*lpdwBufferLength < ((wc.length() + 1) * sizeof(TCHAR))))
+            return FALSE;
+
         std::copy(wc.begin(), wc.end(), wbuffer);
-        wbuffer[strlen(url)] = TEXT('\0');
 #else
-        strncpy(wbuffer, url, length);
+        std::string urlstr;
+        urlstr.assign(url);
+        std::copy(urlstr.begin(), urlstr.end(), wbuffer);
 #endif
-        if (wbuffer[length] != TEXT('\0'))
-        {
-            if (lpdwBufferLength)
-            {
-                if ((length + 1) < (*lpdwBufferLength / sizeof(TCHAR)))
-                {
-                    wbuffer[length] = 0;
-                }
-                else
-                {
-                    wbuffer[(*lpdwBufferLength / sizeof(TCHAR)) - 1] = 0;
-                }
-            }
-            else
-            {
-                wbuffer[length] = 0;
-            }
-        }
+        wbuffer[strlen(url)] = TEXT('\0');
         if (lpdwBufferLength)
             *lpdwBufferLength = (DWORD)length;
     }
@@ -3487,9 +3384,9 @@ WinHttpQueryOption
         if (SizeCheck(lpBuffer, lpdwBufferLength, sizeof(HTTP_VERSION_INFO)) == FALSE)
             return FALSE;
 
-        if (!lpBuffer)
-            return FALSE;
+        HTTP_VERSION_INFO version;
 
+#if (LIBCURL_VERSION_MAJOR>=7) && (LIBCURL_VERSION_MINOR >= 50)
         long curlversion;
         CURLcode rc;
 
@@ -3497,7 +3394,6 @@ WinHttpQueryOption
         if (rc != CURLE_OK)
             return FALSE;
 
-        HTTP_VERSION_INFO version;
 
         if (curlversion == CURL_HTTP_VERSION_1_0)
         {
@@ -3511,11 +3407,15 @@ WinHttpQueryOption
         }
         else if (curlversion == CURL_HTTP_VERSION_2_0)
         {
-            version.dwMinorVersion = 1;
-            version.dwMajorVersion = 1;
+            version.dwMinorVersion = 0;
+            version.dwMajorVersion = 2;
         }
         else
             return FALSE;
+#else
+        version.dwMinorVersion = 1;
+        version.dwMajorVersion = 1;
+#endif
 
         memcpy(lpBuffer, &version, sizeof(version));
         if (lpdwBufferLength)
@@ -3567,7 +3467,10 @@ BOOLAPI WinHttpCrackUrl(
             if (lpUrlComponents->dwHostNameLength != (DWORD)-1)
             {
                 if (lpUrlComponents->dwHostNameLength >= (strlen(host) + 1)) {
-                    WCTNCPY(lpUrlComponents->lpszHostName, (TCHAR*)pwszUrl + pos, strlen(host));
+                    TSTRING hoststr;
+                    hoststr.assign((TCHAR*)pwszUrl + pos, strlen(host));
+
+                    std::copy(hoststr.begin(), hoststr.end(), lpUrlComponents->lpszHostName);
                     lpUrlComponents->lpszHostName[strlen(host)] = TEXT('\0');
                     lpUrlComponents->dwHostNameLength = strlen(host);
                 }
@@ -3590,7 +3493,10 @@ BOOLAPI WinHttpCrackUrl(
             if (lpUrlComponents->dwSchemeLength != (DWORD)-1)
             {
                 if (lpUrlComponents->dwSchemeLength >= (strlen(scheme) + 1)) {
-                    WCTNCPY(lpUrlComponents->lpszScheme, (TCHAR*)pwszUrl + pos, strlen(scheme));
+                    TSTRING schemestr;
+                    schemestr.assign((TCHAR*)pwszUrl + pos, strlen(scheme));
+
+                    std::copy(schemestr.begin(), schemestr.end(), lpUrlComponents->lpszScheme);
                     lpUrlComponents->lpszScheme[strlen(scheme)] = TEXT('\0');
                     lpUrlComponents->dwSchemeLength = strlen(scheme);
                 }
@@ -3622,7 +3528,10 @@ BOOLAPI WinHttpCrackUrl(
             if (lpUrlComponents->dwUrlPathLength != (DWORD)-1)
             {
                 if (lpUrlComponents->dwUrlPathLength >= (strlen(path) + 1)) {
-                    WCTNCPY(lpUrlComponents->lpszUrlPath, (TCHAR*)pwszUrl + pos, strlen(path));
+                    TSTRING urlstr;
+                    urlstr.assign((TCHAR*)pwszUrl + pos, strlen(path));
+
+                    std::copy(urlstr.begin(), urlstr.end(), lpUrlComponents->lpszUrlPath);
                     lpUrlComponents->lpszUrlPath[strlen(path)] = TEXT('\0');
                     lpUrlComponents->dwUrlPathLength = strlen(path);
                 }
@@ -3652,7 +3561,10 @@ BOOLAPI WinHttpCrackUrl(
             if (lpUrlComponents->dwExtraInfoLength != (DWORD)-1)
             {
                 if (lpUrlComponents->dwExtraInfoLength >= (strlen(query) + 1)) {
-                    WCTNCPY(lpUrlComponents->lpszExtraInfo, (TCHAR*)pwszUrl + pos - 1, strlen(query));
+                    TSTRING extrainfo;
+                    extrainfo.assign((TCHAR*)pwszUrl + pos - 1, strlen(query));
+
+                    std::copy(extrainfo.begin(), extrainfo.end(), lpUrlComponents->lpszExtraInfo);
                     lpUrlComponents->lpszExtraInfo[strlen(query)] = TEXT('\0');
                     lpUrlComponents->dwExtraInfoLength = strlen(query);
                 }
@@ -3674,7 +3586,10 @@ BOOLAPI WinHttpCrackUrl(
             if (lpUrlComponents->dwUserNameLength != (DWORD)-1)
             {
                 if (lpUrlComponents->dwUserNameLength >= (strlen(user) + 1)) {
-                    WCTNCPY(lpUrlComponents->lpszUserName, (TCHAR*)pwszUrl + pos - 1, strlen(user));
+                    TSTRING userstr;
+                    userstr.assign((TCHAR*)pwszUrl + pos - 1, strlen(user));
+
+                    std::copy(userstr.begin(), userstr.end(), lpUrlComponents->lpszUserName);
                     lpUrlComponents->lpszUserName[strlen(user)] = TEXT('\0');
                     lpUrlComponents->dwUserNameLength = strlen(user);
                 }
@@ -3696,7 +3611,11 @@ BOOLAPI WinHttpCrackUrl(
             if (lpUrlComponents->dwPasswordLength != (DWORD)-1)
             {
                 if (lpUrlComponents->dwPasswordLength >= (strlen(pw) + 1)) {
-                    WCTNCPY(lpUrlComponents->lpszPassword, (TCHAR*)pwszUrl + pos - 1, strlen(pw));
+                    TSTRING pwstr;
+                    pwstr.assign((TCHAR*)pwszUrl + pos - 1, strlen(pw));
+
+                    std::copy(pwstr.begin(), pwstr.end(), lpUrlComponents->lpszPassword);
+
                     lpUrlComponents->lpszPassword[strlen(pw)] = TEXT('\0');
                     lpUrlComponents->dwPasswordLength = strlen(pw);
                 }
@@ -3735,16 +3654,16 @@ BOOLAPI WinHttpWriteData
 
     if (request->GetClosing())
     {
-        TRACE("%s:%d \n", __func__, __LINE__);
+        TRACE("%-35s:%-8d:%-16p \n", __func__, __LINE__, (void*)request);
         return FALSE;
     }
 
-    TRACE("%s:%d dwNumberOfBytesToWrite:%lu\n", __func__, __LINE__, dwNumberOfBytesToWrite);
+    TRACE("%-35s:%-8d:%-16p dwNumberOfBytesToWrite:%lu\n", __func__, __LINE__, (void*)request, dwNumberOfBytesToWrite);
     if (request->GetAsync())
     {
         {
             std::lock_guard<std::mutex> lck(request->GetReadDataEventMtx());
-            request->QueueWriteRequest(lpBuffer, dwNumberOfBytesToWrite);
+            QueueBufferRequest(request->GetOutstandingWrites(), const_cast<void*>(lpBuffer), dwNumberOfBytesToWrite);
             request->GetReadDataEventCounter()++;
         }
 

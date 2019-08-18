@@ -31,7 +31,6 @@ typedef wchar_t*            LPTSTR;
 typedef wchar_t*            PTSTR;
 typedef const wchar_t*      LPCTSTR;
 typedef const wchar_t*      PCTSTR;
-#define TEXT(a)              L##a
 #else
 typedef char                TCHAR;
 typedef const char*         LPCTSTR;
@@ -39,7 +38,6 @@ typedef char*               LPTSTR;
 typedef char*               PTSTR;
 typedef const char*         LPCTSTR;
 typedef const char*         PCTSTR;
-#define TEXT(a)              a
 #endif
 
 typedef LPVOID HINTERNET;
@@ -76,6 +74,8 @@ typedef struct
 }
 HTTP_VERSION_INFO;
 
+#define WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH 0
+
 enum
 {
     WINHTTP_QUERY_RAW_HEADERS,
@@ -97,81 +97,21 @@ enum
     WINHTTP_AUTH_TARGET_SERVER,
 };
 
-#define WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH             0
-#define WINHTTP_INVALID_STATUS_CALLBACK                 (WINHTTP_STATUS_CALLBACK)-1
+#define WINHTTP_INVALID_STATUS_CALLBACK (WINHTTP_STATUS_CALLBACK)-1
 
-#define WINHTTP_NO_REFERER                              NULL
-#define WINHTTP_DEFAULT_ACCEPT_TYPES                    NULL
-#define WINHTTP_NO_ADDITIONAL_HEADERS                   NULL
-#define WINHTTP_NO_REQUEST_DATA                         NULL
-#define WINHTTP_NO_PROXY_NAME                           NULL
-#define WINHTTP_NO_PROXY_BYPASS                         NULL
-#define WINHTTP_NO_HEADER_INDEX                         NULL
-#define WINHTTP_HEADER_NAME_BY_INDEX                    NULL
-#define WINHTTP_NO_OUTPUT_BUFFER                        NULL
+#define WINHTTP_NO_REFERER              NULL
+#define WINHTTP_DEFAULT_ACCEPT_TYPES    NULL
+#define WINHTTP_NO_ADDITIONAL_HEADERS   NULL
+#define WINHTTP_NO_REQUEST_DATA         NULL
+#define WINHTTP_NO_PROXY_NAME           NULL
+#define WINHTTP_NO_PROXY_BYPASS         NULL
+#define WINHTTP_NO_HEADER_INDEX         NULL
+#define WINHTTP_HEADER_NAME_BY_INDEX    NULL
+#define WINHTTP_NO_OUTPUT_BUFFER        NULL
 
-#define WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH           0
-#define WINHTTP_ADDREQ_FLAG_ADD                         0
-#define WINHTTP_ENABLE_SSL_REVOCATION                   0
-
-#define INTERNET_DEFAULT_HTTP_PORT                      80
-#define ARRAYSIZE(n)                                    sizeof(n)/sizeof(n[0])
-
-#define GetLastError()                                  errno
-#define CALLBACK
-
-#define FALSE                                           0
-#define TRUE                                            1
-
-#define INTERNET_DEFAULT_HTTPS_PORT                     443
-#define S_OK                                            0
-
-#define ERROR_INSUFFICIENT_BUFFER 	                    ENOMEM
-#define ERROR_WINHTTP_RESEND_REQUEST 	                EBUSY
-#define ERROR_SUCCESS 			                        0
-#define ERROR_OPERATION_ABORTED		                    EINVAL
-#define ERROR_NOT_ENOUGH_MEMORY		                    ENOMEM
-#define ERROR_WINHTTP_TIMEOUT		                    ETIMEDOUT
-#define ERROR_INVALID_PARAMETER		                    EINVAL
-
-#define BOOLAPI                                         BOOL
-#define SetLastError(val)                               errno = val
-#define WINHTTPAPI
-#define WINAPI
-
-#ifdef min
-#define MIN                                             min
-#define MAX                                             max
-#else
-#define MIN                                             std::min
-#define MAX                                             std::max
-#endif
-
-#ifdef UNICODE
-#define WCTLEN                                          wcslen
-#define WCTCMP                                          wcscmp
-#define WCTCPY                                          wcscpy
-#define WCTNCPY                                         wcsncpy
-#define STNPRINTF                                       swprintf
-#define TSTRING                                         std::wstring
-#define STRING_LITERAL                                  "%S"
-#define TO_STRING                                       std::to_wstring
-#define TREGEX                                          std::wregex
-#define TREGEX_SEARCH                                   std::regex_search
-#define TREGEX_MATCH                                    std::wsmatch
-#else
-#define WCTLEN                                          strlen
-#define WCTCMP                                          strcmp
-#define WCTCPY                                          strcpy
-#define WCTNCPY                                         strncpy
-#define STNPRINTF                                       snprintf
-#define TSTRING                                         std::string
-#define STRING_LITERAL                                  "%s"
-#define TO_STRING                                       std::to_string
-#define TREGEX                                          std::regex
-#define TREGEX_SEARCH                                   std::regex_search
-#define TREGEX_MATCH                                    std::smatch
-#endif
+#define WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH 0
+#define WINHTTP_ADDREQ_FLAG_ADD 0
+#define WINHTTP_ENABLE_SSL_REVOCATION 0
 
 enum
 {
@@ -188,36 +128,36 @@ enum
 
 enum
 {
-    WINHTTP_CALLBACK_STATUS_READ_COMPLETE = (1 << 0),
-    WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE = (1 << 1),
-    WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE = (1 << 2),
-    WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE = (1 << 3),
-    WINHTTP_CALLBACK_STATUS_REQUEST_ERROR = (1 << 4),
-    WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING = (1 << 5),
-    WINHTTP_CALLBACK_STATUS_SECURE_FAILURE = (1 << 6),
-    WINHTTP_CALLBACK_STATUS_SENDING_REQUEST = (1 << 7),
-    WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE = (1 << 8),
-    WINHTTP_CALLBACK_STATUS_FLAG_CERT_REV_FAILED = (1 << 9),
-    WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CERT = (1 << 10),
-    WINHTTP_CALLBACK_STATUS_FLAG_CERT_REVOKED = (1 << 11),
-    WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CA = (1 << 12),
-    WINHTTP_CALLBACK_STATUS_FLAG_CERT_CN_INVALID = (1 << 13),
-    WINHTTP_CALLBACK_STATUS_FLAG_CERT_DATE_INVALID = (1 << 14),
-    WINHTTP_CALLBACK_STATUS_FLAG_SECURITY_CHANNEL_ERROR = (1 << 15),
-    WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE = (1 << 16),
-    WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED = (1 << 17),
-    WINHTTP_CALLBACK_STATUS_REQUEST_SENT = (1 << 18),
-    WINHTTP_CALLBACK_STATUS_REDIRECT = (1 << 19),
-    WINHTTP_CALLBACK_STATUS_RESOLVING_NAME = (1 << 20),
-    WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS = (1 << 24),
-    WINHTTP_CALLBACK_FLAG_HANDLES = (1 << 25),
-    WINHTTP_CALLBACK_FLAG_SECURE_FAILURE = (1 << 26),
-    WINHTTP_CALLBACK_FLAG_SEND_REQUEST = (1 << 27),
+    WINHTTP_CALLBACK_STATUS_READ_COMPLETE = 0x1,
+    WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE = 0x2,
+    WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE = 0x4,
+    WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE = 0x8,
+    WINHTTP_CALLBACK_STATUS_REQUEST_ERROR = 0x10,
+    WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING = 0x20,
+    WINHTTP_CALLBACK_STATUS_SECURE_FAILURE = 0x40,
+    WINHTTP_CALLBACK_STATUS_SENDING_REQUEST = 0x80,
+    WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE = 0x100,
+    WINHTTP_CALLBACK_STATUS_FLAG_CERT_REV_FAILED = 0x200,
+    WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CERT = 0x400,
+    WINHTTP_CALLBACK_STATUS_FLAG_CERT_REVOKED = 0x800,
+    WINHTTP_CALLBACK_STATUS_FLAG_INVALID_CA = 0x1000,
+    WINHTTP_CALLBACK_STATUS_FLAG_CERT_CN_INVALID = 0x2000,
+    WINHTTP_CALLBACK_STATUS_FLAG_CERT_DATE_INVALID = 0x4000,
+    WINHTTP_CALLBACK_STATUS_FLAG_SECURITY_CHANNEL_ERROR = 0x8000,
+    WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE = 0x10000,
+    WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED = 0x20000,
+    WINHTTP_CALLBACK_STATUS_REQUEST_SENT = 0x40000,
+    WINHTTP_CALLBACK_STATUS_REDIRECT = 0x80000,
+    WINHTTP_CALLBACK_STATUS_RESOLVING_NAME = 0x100000,
+    WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS = 0x200000,
+    WINHTTP_CALLBACK_FLAG_HANDLES = 0x400000,
+    WINHTTP_CALLBACK_FLAG_SECURE_FAILURE = 0x800000,
+    WINHTTP_CALLBACK_FLAG_SEND_REQUEST = 0x1000000,
 };
 
 enum
 {
-    WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS = (1 << 0),
+    WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS = 1,
 };
 
 enum
@@ -256,6 +196,9 @@ enum
 };
 
 typedef unsigned int INTERNET_PORT;
+
+#define INTERNET_DEFAULT_HTTP_PORT 80
+
 
 BOOL WinHttpCloseHandle(
     HINTERNET hInternet
@@ -383,6 +326,11 @@ BOOL WinHttpWriteData(
     LPDWORD  lpdwNumberOfBytesWritten
 );
 
+#define ARRAYSIZE(n) sizeof(n)/sizeof(n[0])
+
+#define GetLastError() errno
+#define CALLBACK
+
 
 typedef struct {
     DWORD  dwAccessType;
@@ -437,6 +385,35 @@ enum
     WINHTTP_AUTO_DETECT_TYPE_DNS_A,
     WINHTTP_AUTOPROXY_CONFIG_URL,
 };
+
+
+#define GlobalFree free
+
+#define FALSE 0
+#define TRUE 1
+
+#define INTERNET_DEFAULT_HTTPS_PORT 443
+#define S_OK 0
+
+#define ERROR_INSUFFICIENT_BUFFER 	ENOMEM
+#define ERROR_WINHTTP_RESEND_REQUEST 	EBUSY
+#define ERROR_SUCCESS 			0
+#define ERROR_OPERATION_ABORTED		EINVAL
+#define ERROR_NOT_ENOUGH_MEMORY		ENOMEM
+#define ERROR_WINHTTP_TIMEOUT		ETIMEDOUT
+#define ERROR_INVALID_PARAMETER		EINVAL
+
+#include <memory>
+
+template<typename T, typename... Args>
+std::unique_ptr<T> make_unique(Args&&... args) {
+    return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+}
+
+#define BOOLAPI BOOL
+#define SetLastError(val) errno = val
+#define WINHTTPAPI
+#define WINAPI
 
 typedef enum {
 	INTERNET_SCHEME_HTTP = 1,

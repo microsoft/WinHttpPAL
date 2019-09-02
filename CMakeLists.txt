@@ -28,7 +28,7 @@ target_include_directories(winhttppal
 )
 
 target_compile_features(winhttppal PRIVATE cxx_auto_type)
-target_compile_options(winhttppal PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wall>)
+target_compile_options(winhttppal PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wall -fPIC>)
 
 target_link_libraries(winhttppal
     PUBLIC

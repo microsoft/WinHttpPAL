@@ -6,7 +6,7 @@
  *
  * HTTP Library: Client-side APIs.
  *
- * This file contains WinHttp client implementation using CURL.
+ * This file contains WinHttpPAL class declarations.
  *
  * For the latest on this and related APIs, please see: https://github.com/microsoft/WinHttpPAL
  *

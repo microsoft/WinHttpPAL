@@ -14,11 +14,16 @@ add_library(winhttppal SHARED src/winhttppal.cpp)
 add_library(winhttppal-static src/winhttppal.cpp)
 
 set_target_properties(winhttppal PROPERTIES
-    SOVERSION 1
-    PUBLIC_HEADER inc/winhttppal.h)
+    SOVERSION 1)
 
 #compile flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O2" )
 
 target_link_libraries(winhttppal pthread dl stdc++ ${CURL_LIBRARIES} crypto ssl)
 target_link_libraries(winhttppal-static pthread dl stdc++ ${CURL_LIBRARIES} crypto ssl)
+set_target_properties(winhttppal-static PROPERTIES OUTPUT_NAME "winhttppal")
+
+install(TARGETS winhttppal-static DESTINATION lib)
+install(TARGETS winhttppal DESTINATION lib)
+install(FILES inc/winhttppal.h src/winhttppal_imp.h DESTINATION include)
+

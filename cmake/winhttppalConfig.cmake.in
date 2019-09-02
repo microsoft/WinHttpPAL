@@ -1,0 +1,15 @@
+get_filename_component(winhttppal_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
+include(CMakeFindDependencyMacro)
+
+list(APPEND CMAKE_MODULE_PATH ${winhttppal_CMAKE_DIR})
+
+# NOTE Had to use find_package because find_dependency does not support COMPONENTS or MODULE until 3.8.0
+
+find_package(CURL 1.57 REQUIRED MODULE)
+list(REMOVE_AT CMAKE_MODULE_PATH -1)
+
+if(NOT TARGET winhttppal::winhttppal)
+    include("${winhttppal_CMAKE_DIR}/winhttppalTargets.cmake")
+endif()
+
+set(winhttppal_LIBRARIES winhttppal::winhttppal)

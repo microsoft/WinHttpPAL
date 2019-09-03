@@ -3189,3 +3189,55 @@ BOOL WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG 
 {
     return FALSE;
 }
+
+BOOL WinHttpSetCredentials(
+  HINTERNET hRequest,
+  DWORD     AuthTargets,
+  DWORD     AuthScheme,
+  LPCTSTR   pwszUserName,
+  LPCTSTR   pwszPassword,
+  LPVOID    pAuthParams
+)
+{
+    WinHttpRequestImp *request = static_cast<WinHttpRequestImp *>(hRequest);
+    if (!request)
+        return FALSE;
+
+    std::shared_ptr<WinHttpRequestImp> srequest = request->shared_from_this();
+    if (!srequest)
+        return FALSE;
+
+    std::string username;
+    std::string password;
+
+    ConvertCstrAssign(pwszUserName, WCTLEN(pwszUserName), username);
+    ConvertCstrAssign(pwszPassword, WCTLEN(pwszPassword), password);
+
+    std::string userpwd = username + ":" + password;
+
+    if (WINHTTP_AUTH_TARGET_PROXY == AuthTargets)
+    {
+        curl_easy_setopt(request->GetCurl(), CURLOPT_PROXYUSERPWD, userpwd.c_str());
+        curl_easy_setopt(request->GetCurl(), CURLOPT_PROXYAUTH, CURLAUTH_ANYSAFE);
+    }
+    else
+    {
+        curl_easy_setopt(request->GetCurl(), CURLOPT_USERPWD, userpwd.c_str());
+        curl_easy_setopt(request->GetCurl(), CURLOPT_HTTPAUTH, CURLAUTH_ANYSAFE);
+    }
+
+    return TRUE;
+}
+
+BOOL WinHttpQueryAuthSchemes(
+    HINTERNET hRequest,
+    LPDWORD  lpdwSupportedSchemes,
+    LPDWORD  lpdwFirstScheme,
+    LPDWORD  pdwAuthTarget
+)
+{
+    *lpdwSupportedSchemes = 0xFF;
+    *lpdwFirstScheme = WINHTTP_AUTH_SCHEME_NEGOTIATE;
+    *pdwAuthTarget = WINHTTP_AUTH_TARGET_SERVER;
+    return TRUE;
+}

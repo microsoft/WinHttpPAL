@@ -3179,3 +3179,13 @@ BOOL WinHttpGetProxyForUrl(
 {
     return FALSE;
 }
+
+BOOL WinHttpGetDefaultProxyConfiguration(WINHTTP_PROXY_INFO *pProxyInfo)
+{
+    return FALSE;
+}
+
+BOOL WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG *pProxyConfig)
+{
+    return FALSE;
+}

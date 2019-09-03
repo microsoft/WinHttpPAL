@@ -378,6 +378,10 @@ BOOL WinHttpSetCredentials(
     LPVOID    pAuthParams
 );
 
+BOOL WinHttpGetDefaultProxyConfiguration(WINHTTP_PROXY_INFO *pProxyInfo);
+
+BOOL WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG *pProxyConfig);
+
 enum
 {
     WINHTTP_AUTOPROXY_AUTO_DETECT,

@@ -111,7 +111,7 @@ enum
 
 #define WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH 0
 #define WINHTTP_ADDREQ_FLAG_ADD 0
-#define WINHTTP_ENABLE_SSL_REVOCATION 0
+#define WINHTTP_ENABLE_SSL_REVOCATION 1
 
 enum
 {
@@ -437,3 +437,4 @@ typedef struct {
   LPTSTR          lpszExtraInfo;
   DWORD           dwExtraInfoLength;
 } URL_COMPONENTS, *LPURL_COMPONENTS;
+

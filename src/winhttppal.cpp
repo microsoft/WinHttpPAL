@@ -2699,6 +2699,18 @@ BOOLAPI WinHttpSetOption(
 
         return FALSE;
     }
+    else if (dwOption == WINHTTP_OPTION_ENABLE_FEATURE)
+    {
+        if (dwBufferLength != sizeof(DWORD))
+            return FALSE;
+
+        DWORD dwEnableSSLRevocationOpt = *static_cast<DWORD*>(lpBuffer);
+
+        if (dwEnableSSLRevocationOpt == WINHTTP_ENABLE_SSL_REVOCATION)
+            return TRUE;
+
+        return FALSE;
+    }
     else if (dwOption == WINHTTP_OPTION_SECURITY_FLAGS)
     {
         WinHttpRequestImp *request;
@@ -3155,4 +3167,15 @@ BOOLAPI WinHttpWriteData
         *lpdwNumberOfBytesWritten = dwNumberOfBytesToWrite;
 
     return TRUE;
+}
+
+
+BOOL WinHttpGetProxyForUrl(
+    HINTERNET                 hSession,
+    LPCTSTR                   lpcwszUrl,
+    WINHTTP_AUTOPROXY_OPTIONS *pAutoProxyOptions,
+    WINHTTP_PROXY_INFO       *pProxyInfo
+)
+{
+    return FALSE;
 }

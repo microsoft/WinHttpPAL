@@ -1305,6 +1305,9 @@ BOOL WinHttpRequestImp::AsyncQueue(std::shared_ptr<WinHttpRequestImp> &requestRe
     WINHTTP_STATUS_CALLBACK cb = GetCallback(&dwNotificationFlags);
     LPVOID userdata = NULL;
 
+    if (!requestRef->GetAsync())
+        return FALSE;
+
     userdata = GetUserData();
 
     ctx = new UserCallbackContext(requestRef, dwInternetStatus, static_cast<DWORD>(statusInformationLength),

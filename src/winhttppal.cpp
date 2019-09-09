@@ -164,6 +164,9 @@ static std::mutex trcmtx;
 static void TRACE_INTERNAL(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 #endif
 
+static TSTRING FindRegex(const TSTRING &subject, const TSTRING &regstr);
+static std::vector<std::string> FindRegexA(const std::string &str, const std::string &regstr);
+
 static void TRACE_INTERNAL(const char *fmt, ...)
 {
     std::lock_guard<std::mutex> lck(trcmtx);
@@ -1098,9 +1101,17 @@ size_t WinHttpRequestImp::WriteHeaderFunction(void *ptr, size_t size, size_t nme
     }
     if (EofHeaders && request->GetAsync())
     {
-        DWORD retValue;
+        std::string regstr;
+        DWORD retValue = 501;
 
-        curl_easy_getinfo(request->GetCurl(), CURLINFO_RESPONSE_CODE, &retValue);
+        regstr.append("^HTTP.*[0-9]{3}");
+        std::vector<std::string> result = FindRegexA(request->GetHeaderString(), regstr);
+        for (auto codestr : result)
+        {
+            std::string code = codestr.substr(codestr.length() - 3);
+            retValue = stoi(code);
+        }
+
         if ((retValue == 302) || (retValue == 301))
         {
             std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
@@ -2402,6 +2413,24 @@ static TSTRING FindRegex(const TSTRING &subject,const TSTRING &regstr)
         return TEXT("");
     }
     return result;
+}
+
+static std::vector<std::string> FindRegexA(const std::string &str,const std::string &regstr)
+{
+    std::vector<std::string> results;
+    try {
+        std::regex re(regstr, std::regex_constants::icase);
+        std::smatch match;
+        std::string::const_iterator searchStart(str.cbegin());
+        while (std::regex_search(searchStart, str.cend(), match, re))
+        {
+            results.push_back(match[0]);
+            searchStart = match.suffix().first;
+        }
+    } catch (std::regex_error&) {
+        return results;
+    }
+    return results;
 }
 
 bool is_newline(char i)

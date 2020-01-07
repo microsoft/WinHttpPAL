@@ -2421,11 +2421,14 @@ static std::vector<std::string> FindRegexA(const std::string &str,const std::str
     try {
         std::regex re(regstr, std::regex_constants::icase);
         std::smatch match;
-        std::string::const_iterator searchStart(str.cbegin());
-        while (std::regex_search(searchStart, str.cend(), match, re))
-        {
-            results.push_back(match[0]);
-            searchStart = match.suffix().first;
+        std::istringstream f(str);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::string::const_iterator searchStart(line.cbegin());
+            while (std::regex_search(searchStart, line.cend(), match, re)) {
+                results.push_back(match[0]);
+                searchStart = match.suffix().first;
+            }
         }
     } catch (std::regex_error&) {
         return results;

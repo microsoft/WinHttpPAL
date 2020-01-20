@@ -301,7 +301,7 @@ public:
     std::atomic<bool> &GetRedirectPending() { return m_RedirectPending; }
 
     std::mutex &GetHeaderStringMutex() { return m_HeaderStringMutex; }
-    std::mutex &GetBodyStringMutex() { return m_HeaderStringMutex; }
+    std::mutex &GetBodyStringMutex() { return m_BodyStringMutex; }
 
     BOOL AsyncQueue(std::shared_ptr<WinHttpRequestImp> &,
                     DWORD dwInternetStatus, size_t statusInformationLength,

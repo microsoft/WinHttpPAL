@@ -68,7 +68,8 @@ class WinHttpSessionImp :public WinHttpBase
     DWORD m_NotificationFlags = 0;
 
     int m_ServerPort = 0;
-    long m_Timeout = 15000;
+    long m_ReceiveTimeoutMs = 15000;
+    long m_ConnectionTimeoutMs = 15000;
     BOOL m_Async = false;
 
     bool m_closing = false;
@@ -121,8 +122,11 @@ public:
     int GetServerPort() const { return m_ServerPort; }
     void SetServerPort(int port) { m_ServerPort = port; }
 
-    long GetTimeout() const;
-    void SetTimeout(long timeout) { m_Timeout = timeout; }
+    long GetReceiveTimeoutMs() const { return m_ReceiveTimeoutMs; };
+    void SetReceiveTimeoutMs(long timeout) { m_ReceiveTimeoutMs = timeout; }
+
+    long GetConnectionTimeoutMs() const { return m_ConnectionTimeoutMs; }
+    void SetConnectionTimeoutMs(long timeout) { m_ConnectionTimeoutMs = timeout; }
 
     std::string &GetServerName() { return m_ServerName; }
 
@@ -599,7 +603,6 @@ public:
     void ResumeTransfer(CURL *handle, int bitmask);
     BOOL AddHandle(std::shared_ptr<WinHttpRequestImp> &srequest, CURL *handle);
     BOOL RemoveHandle(std::shared_ptr<WinHttpRequestImp> &srequest, CURL *handle, bool clearPrivate);
-    long GetTimeout();
     void KickStart();
     ComContainer();
     ~ComContainer();

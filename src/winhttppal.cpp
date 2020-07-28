@@ -644,17 +644,6 @@ BOOL ComContainer::RemoveHandle(std::shared_ptr<WinHttpRequestImp> &srequest, CU
     return TRUE;
 }
 
-long ComContainer::GetTimeout()
-{
-    long curl_timeo;
-
-    m_MultiMutex.lock();
-    curl_multi_timeout(m_curlm, &curl_timeo);
-    m_MultiMutex.unlock();
-
-    return curl_timeo;
-}
-
 void ComContainer::KickStart()
 {
     std::lock_guard<std::mutex> lck(m_hAsyncEventMtx);
@@ -742,20 +731,6 @@ void WinHttpHandleContainer<T>::Register(std::shared_ptr<T> rqst)
     TRACE("%-35s:%-8d:%-16p\n", __func__, __LINE__, (void*)(rqst.get()));
     std::lock_guard<std::mutex> lck(m_ActiveRequestMtx);
     m_ActiveRequests.push_back(rqst);
-}
-
-long WinHttpSessionImp::GetTimeout() const {
-    if (m_Timeout)
-        return m_Timeout;
-
-    long curl_timeo;
-
-    curl_timeo = ComContainer::GetInstance().GetTimeout();
-
-    if (curl_timeo < 0)
-        curl_timeo = 10000;
-
-    return curl_timeo;
 }
 
 WinHttpSessionImp::~WinHttpSessionImp()
@@ -1746,9 +1721,15 @@ WINHTTPAPI HINTERNET WINAPI WinHttpOpenRequest(
         }
     }
 
-    if (session->GetTimeout() > 0)
+    if (session->GetConnectionTimeoutMs() > 0)
     {
-        res = curl_easy_setopt(request->GetCurl(), CURLOPT_TIMEOUT_MS, session->GetTimeout());
+        res = curl_easy_setopt(request->GetCurl(), CURLOPT_CONNECTTIMEOUT, session->GetConnectionTimeoutMs()/1000);
+        CURL_BAILOUT_ONERROR(res, request, NULL);
+    }
+
+    if (session->GetReceiveTimeoutMs() > 0)
+    {
+        res = curl_easy_setopt(request->GetCurl(), CURLOPT_TIMEOUT_MS, session->GetReceiveTimeoutMs());
         CURL_BAILOUT_ONERROR(res, request, NULL);
     }
 
@@ -2384,11 +2365,14 @@ WinHttpSetTimeouts
           __func__, __LINE__, (void*)base, nResolveTimeout, nConnectTimeout, nSendTimeout, nReceiveTimeout);
     if ((session = dynamic_cast<WinHttpSessionImp *>(base)))
     {
-        session->SetTimeout(nReceiveTimeout);
+        session->SetReceiveTimeoutMs(nReceiveTimeout);
+        session->SetConnectionTimeoutMs(nConnectTimeout);
     }
     else if ((request = dynamic_cast<WinHttpRequestImp *>(base)))
     {
         res = curl_easy_setopt(request->GetCurl(), CURLOPT_TIMEOUT_MS, nReceiveTimeout);
+        CURL_BAILOUT_ONERROR(res, request, FALSE);
+        res = curl_easy_setopt(request->GetCurl(), CURLOPT_CONNECTTIMEOUT, nConnectTimeout/1000);
         CURL_BAILOUT_ONERROR(res, request, FALSE);
     }
     else
@@ -2847,7 +2831,7 @@ WinHttpQueryOption
         if (!session)
             return FALSE;
 
-        *static_cast<DWORD *>(lpBuffer) = session->GetTimeout();
+        *static_cast<DWORD *>(lpBuffer) = session->GetConnectionTimeoutMs();
     }
     if (WINHTTP_OPTION_CALLBACK == dwOption)
     {

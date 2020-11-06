@@ -497,8 +497,8 @@ class WinHttpHandleContainer
 public:
     static WinHttpHandleContainer &Instance()
     {
-        static WinHttpHandleContainer the_instance;
-        return the_instance;
+        static WinHttpHandleContainer *the_instance = new WinHttpHandleContainer<T>();
+        return *the_instance;
     }
 
     void UnRegister(T *val);

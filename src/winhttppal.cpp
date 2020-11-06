@@ -575,8 +575,8 @@ void ComContainer::FreeCURL(CURL *ptr)
 
 ComContainer &ComContainer::GetInstance()
 {
-    static ComContainer the_instance;
-    return the_instance;
+    static ComContainer *the_instance = new ComContainer();
+    return *the_instance;
 }
 
 void ComContainer::ResumeTransfer(CURL *handle, int bitmask)

@@ -1983,12 +1983,23 @@ BOOLAPI WinHttpSendRequest
             return FALSE;
         }
 
-        request->SetOptionalData(lpOptional, dwOptionalLength);
+        if (!request->SetOptionalData(lpOptional, dwOptionalLength)) return FALSE;
 
         if (request->GetType() == "POST")
         {
             /* Now specify the POST data */
             res = curl_easy_setopt(request->GetCurl(), CURLOPT_POSTFIELDS, request->GetOptionalData().c_str());
+            CURL_BAILOUT_ONERROR(res, request, FALSE);
+        }
+        else if (request->GetType() == "PUT")
+        {
+            res = curl_easy_setopt(request->GetCurl(), CURLOPT_CUSTOMREQUEST, "PUT");
+            CURL_BAILOUT_ONERROR(res, request, FALSE);
+
+            res = curl_easy_setopt(request->GetCurl(), CURLOPT_POSTFIELDS, request->GetOptionalData().c_str()); // data goes here 
+            CURL_BAILOUT_ONERROR(res, request, FALSE);
+
+            res = curl_easy_setopt(request->GetCurl(), CURLOPT_POSTFIELDSIZE, dwOptionalLength); // length is a must
             CURL_BAILOUT_ONERROR(res, request, FALSE);
         }
     }

@@ -1080,7 +1080,7 @@ size_t WinHttpRequestImp::WriteHeaderFunction(void *ptr, size_t size, size_t nme
         DWORD retValue = 501;
 
         TRACE_VERBOSE("%-35s:%-8d:%-16p Header string:%s\n", __func__, __LINE__, (void*)request, request->GetHeaderString().c_str());
-        regstr.append("^HTTP.*[0-9]{3}");
+        regstr.append("^HTTP/[0-9.]* [0-9]{3}");
         std::vector<std::string> result = FindRegexA(request->GetHeaderString(), regstr);
         for (auto codestr : result)
         {
@@ -1106,6 +1106,8 @@ size_t WinHttpRequestImp::WriteHeaderFunction(void *ptr, size_t size, size_t nme
         }
         else
         {
+            std::lock_guard<std::mutex> lck(request->GetHeaderStringMutex());
+            request->GetHeaderString() = "";
             TRACE("%-35s:%-8d:%-16p retValue = %lu \n", __func__, __LINE__, (void*)request, retValue);
         }
 

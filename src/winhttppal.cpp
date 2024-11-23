@@ -2763,6 +2763,11 @@ BOOLAPI WinHttpSetOption(
                 request->VerifyPeer() = 0L;
                 request->VerifyHost() = 0L;
             }
+            else if (value == SECURITY_FLAG_IGNORE_CERT_CN_INVALID)
+            {
+                request->VerifyPeer() = 1L;
+                request->VerifyHost() = 0L;
+            }
             else if (!value)
             {
                 request->VerifyPeer() = 1L;

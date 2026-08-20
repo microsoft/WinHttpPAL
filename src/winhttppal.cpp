@@ -1327,7 +1327,7 @@ size_t WinHttpRequestImp::ReadCallback(void *ptr, size_t size, size_t nmemb, voi
     {
         len = MIN(request->GetOptionalData().length(), size * nmemb);
         TRACE("%-35s:%-8d:%-16p writing optional length of %lu\n", __func__, __LINE__, (void*)request, len);
-        std::copy(request->GetOptionalData().begin(), request->GetOptionalData().end(), static_cast<char*>(ptr));
+        std::copy(request->GetOptionalData().begin(), request->GetOptionalData().begin() + len, static_cast<char*>(ptr));
         request->GetOptionalData().erase(0, len);
         request->GetReadLength() += len;
         return len;
